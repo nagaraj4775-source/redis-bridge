@@ -10,6 +10,7 @@ package tests
 //
 // Prerequisites:
 //   make up-embedded-cluster
+// 	 Ensure Go is installed in the system 
 //
 // Run manually:
 //   go test -v -timeout 120s -run "^TestEmbeddedCluster" ./tests/
