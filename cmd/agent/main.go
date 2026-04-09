@@ -1,0 +1,314 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/nagaraju/redibridge/internal/applier"
+	"github.com/nagaraju/redibridge/internal/bus"
+	"github.com/nagaraju/redibridge/internal/config"
+	"github.com/nagaraju/redibridge/internal/consumer"
+	"github.com/nagaraju/redibridge/internal/coordinator"
+	"github.com/nagaraju/redibridge/internal/dedup"
+	"github.com/nagaraju/redibridge/internal/hlc"
+	"github.com/nagaraju/redibridge/internal/producer"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
+	"go.uber.org/zap"
+)
+
+func main() {
+	configPath := flag.String("config", "config/agent.yaml", "Path to config file")
+	flag.Parse()
+
+	// Structured logger
+	logger, err := zap.NewProduction()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to init logger: %v\n", err)
+		os.Exit(1)
+	}
+	defer logger.Sync()
+
+	// Load config
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		logger.Fatal("failed to load config", zap.Error(err))
+	}
+	logger.Info("config loaded",
+		zap.String("site_id", cfg.SiteID),
+		zap.Strings("masters", cfg.Cluster.Masters),
+		zap.Strings("peers", cfg.Peers))
+
+	// Context with signal handling
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		logger.Info("received signal, shutting down", zap.String("signal", sig.String()))
+		cancel()
+	}()
+
+	// Create Redis clients based on cluster mode
+	masters, err := buildClusterClients(ctx, cfg, logger)
+	if err != nil {
+		logger.Fatal("failed to build cluster clients", zap.Error(err))
+	}
+
+	// Use first client as the local client for consumer/applier operations
+	localClient := masters[0]
+
+	// Create HLC
+	clock := hlc.New()
+
+	// Create bus based on bus mode
+	replBus, err := buildBusClient(cfg, logger)
+	if err != nil {
+		logger.Fatal("failed to build bus client", zap.Error(err))
+	}
+	if err := pingBus(ctx, replBus); err != nil {
+		logger.Fatal("failed to connect to bus", zap.Error(err))
+	}
+	logger.Info("connected to bus",
+		zap.String("mode", string(cfg.Bus.Mode)),
+		zap.String("addr", resolvedBusAddr(cfg)))
+
+	// Create dedup filter
+	dedupTTLMs := cfg.Replication.DedupTTLSeconds * 1000
+	dd, err := dedup.NewFilter(localClient, dedupTTLMs, 100000)
+	if err != nil {
+		logger.Fatal("failed to create dedup filter", zap.Error(err))
+	}
+
+	// Create applier
+	app := applier.New(localClient, dd, logger)
+
+	// Create producer
+	prod := producer.New(cfg.SiteID, masters, replBus, clock, dd, logger)
+
+	// Create consumer
+	cons := consumer.New(
+		cfg.SiteID,
+		cfg.Peers,
+		replBus,
+		localClient,
+		app,
+		dd,
+		clock,
+		cfg.Bus.ConsumerGroup,
+		cfg.Replication.BatchSize,
+		cfg.Replication.ApplyConcurrency,
+		logger,
+	)
+
+	// Create coordinator
+	coord := coordinator.New(cfg, cons, logger)
+
+	// Start all components
+	var wg sync.WaitGroup
+
+	// Start Prometheus metrics server
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		metricsAddr := fmt.Sprintf(":%d", cfg.Metrics.Port)
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		srv := &http.Server{Addr: metricsAddr, Handler: mux}
+		logger.Info("metrics server listening", zap.String("addr", metricsAddr))
+
+		go func() {
+			<-ctx.Done()
+			srv.Close()
+		}()
+
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			logger.Error("metrics server error", zap.Error(err))
+		}
+	}()
+
+	// Start coordinator
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		go func() {
+			<-ctx.Done()
+			coord.Stop()
+		}()
+		if err := coord.Run(); err != http.ErrServerClosed {
+			logger.Error("coordinator error", zap.Error(err))
+		}
+	}()
+
+	// Start producer
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := prod.Run(ctx); err != nil {
+			logger.Error("producer error", zap.Error(err))
+		}
+	}()
+
+	// Start consumer
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := cons.Run(ctx); err != nil {
+			logger.Error("consumer error", zap.Error(err))
+		}
+	}()
+
+	logger.Info("redibridge started",
+		zap.String("site_id", cfg.SiteID),
+		zap.Int("masters", len(masters)),
+		zap.Int("peers", len(cfg.Peers)))
+
+	wg.Wait()
+
+	// Cleanup
+	for _, m := range masters {
+		m.Close()
+	}
+	if err := replBus.Close(); err != nil {
+		logger.Warn("bus close error", zap.Error(err))
+	}
+
+	logger.Info("redibridge stopped")
+}
+
+// buildClusterClients creates Redis clients based on the cluster mode in config.
+//
+//   - standalone: one client to a single Redis instance
+//   - sentinel:   one FailoverClient that auto-follows the Sentinel master
+//   - cluster:    one client per shard master (current default)
+func buildClusterClients(ctx context.Context, cfg *config.Config, logger *zap.Logger) ([]*redis.Client, error) {
+	opts := &redis.Options{
+		Password:     cfg.Cluster.Password,
+		PoolSize:     32,
+		MinIdleConns: 4,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
+	}
+
+	switch cfg.Cluster.Mode {
+	case config.ModeStandalone:
+		opts.Addr = cfg.Cluster.Addr
+		c := redis.NewClient(opts)
+		if err := c.Ping(ctx).Err(); err != nil {
+			return nil, fmt.Errorf("ping standalone %s: %w", cfg.Cluster.Addr, err)
+		}
+		logger.Info("connected to standalone redis", zap.String("addr", cfg.Cluster.Addr))
+		return []*redis.Client{c}, nil
+
+	case config.ModeSentinel:
+		c := redis.NewFailoverClient(&redis.FailoverOptions{
+			MasterName:    cfg.Cluster.SentinelMaster,
+			SentinelAddrs: cfg.Cluster.SentinelAddrs,
+			Password:      cfg.Cluster.Password,
+			PoolSize:      32,
+			MinIdleConns:  4,
+			ReadTimeout:   3 * time.Second,
+			WriteTimeout:  3 * time.Second,
+		})
+		if err := c.Ping(ctx).Err(); err != nil {
+			return nil, fmt.Errorf("ping sentinel master %s: %w", cfg.Cluster.SentinelMaster, err)
+		}
+		logger.Info("connected via sentinel",
+			zap.String("master", cfg.Cluster.SentinelMaster),
+			zap.Strings("sentinels", cfg.Cluster.SentinelAddrs))
+		return []*redis.Client{c}, nil
+
+	case config.ModeCluster:
+		clients := make([]*redis.Client, len(cfg.Cluster.Masters))
+		for i, addr := range cfg.Cluster.Masters {
+			opts.Addr = addr
+			optsCopy := *opts // copy per-client to avoid shared mutation
+			c := redis.NewClient(&optsCopy)
+			if err := c.Ping(ctx).Err(); err != nil {
+				return nil, fmt.Errorf("ping master %s: %w", addr, err)
+			}
+			clients[i] = c
+			logger.Info("connected to cluster master", zap.String("addr", addr))
+		}
+		return clients, nil
+
+	default:
+		return nil, fmt.Errorf("unknown cluster mode: %s", cfg.Cluster.Mode)
+	}
+}
+
+// buildBusClient creates the replication bus based on the bus mode in config.
+func buildBusClient(cfg *config.Config, logger *zap.Logger) (bus.Bus, error) {
+	switch cfg.Bus.Mode {
+	case config.ModeStandalone:
+		return bus.NewRedisStreamsBus(cfg.Bus.Addr, cfg.Bus.Password, cfg.Bus.StreamPrefix, logger), nil
+
+	case config.ModeSentinel:
+		return bus.NewRedisStreamsBusSentinel(
+			cfg.Bus.SentinelMaster,
+			cfg.Bus.SentinelAddrs,
+			cfg.Bus.Password,
+			cfg.Bus.StreamPrefix,
+			logger,
+		), nil
+
+	case config.ModeBusEmbedded:
+		localAddr := resolvedBusAddr(cfg)
+		logger.Info("bus using embedded mode",
+			zap.String("local_addr", localAddr),
+			zap.Any("peer_addrs", cfg.Bus.PeerBusAddrs))
+		return bus.NewPerPeerBus(
+			localAddr,
+			cfg.Bus.PeerBusAddrs,
+			cfg.Bus.Password,
+			cfg.Bus.StreamPrefix,
+			logger,
+		), nil
+
+	default:
+		return nil, fmt.Errorf("unknown bus mode: %s", cfg.Bus.Mode)
+	}
+}
+
+// pingBus pings the underlying Redis client for health check.
+// For PerPeerBus it pings the local bus; for RedisStreamsBus it pings directly.
+func pingBus(ctx context.Context, b bus.Bus) error {
+	switch v := b.(type) {
+	case *bus.RedisStreamsBus:
+		return v.Client().Ping(ctx).Err()
+	case *bus.PerPeerBus:
+		return v.RawLocalBus().Client().Ping(ctx).Err()
+	default:
+		return nil
+	}
+}
+
+// resolvedBusAddr returns the effective Redis address for the bus.
+// For embedded mode it derives the address from the local cluster masters;
+// for all other modes it returns cfg.Bus.Addr directly.
+func resolvedBusAddr(cfg *config.Config) string {
+	if cfg.Bus.Mode != config.ModeBusEmbedded {
+		return cfg.Bus.Addr
+	}
+	switch cfg.Cluster.Mode {
+	case config.ModeCluster:
+		return cfg.Cluster.Masters[cfg.Bus.MasterIndex]
+	case config.ModeSentinel:
+		// For sentinel, return the first sentinel addr as a hint (actual addr is dynamic)
+		if len(cfg.Cluster.SentinelAddrs) > 0 {
+			return cfg.Cluster.SentinelAddrs[0] + " (sentinel)"
+		}
+	case config.ModeStandalone:
+		return cfg.Cluster.Addr
+	}
+	return "(embedded)"
+}

@@ -1,0 +1,38 @@
+site_id: "cluster-b"
+
+cluster:
+  mode: "sentinel"
+  sentinel_master: "mymaster-b"
+  sentinel_addrs:
+    - "sentinel-b-1:26379"
+    - "sentinel-b-2:26379"
+    - "sentinel-b-3:26379"
+  password: ""
+  tls: false
+
+bus:
+  mode: "sentinel"
+  sentinel_master: "bus-master"
+  sentinel_addrs:
+    - "bus-sentinel-1:26379"
+    - "bus-sentinel-2:26379"
+    - "bus-sentinel-3:26379"
+  stream_prefix: "repl:stream:"
+  consumer_group: "repl-consumers"
+  password: ""
+
+peers:
+  - "cluster-a"
+  - "cluster-c"
+
+replication:
+  batch_size: 100
+  apply_concurrency: 8
+  dedup_ttl_seconds: 5
+  max_in_flight: 1000
+
+coordinator:
+  port: 8080
+
+metrics:
+  port: 9090

@@ -1,0 +1,33 @@
+site_id: "site-c"
+
+cluster:
+  mode: "standalone"
+  addr: "redis-c:6379"
+  password: ""
+  tls: false
+
+bus:
+  mode: "embedded"        # reuse redis-c as the bus — no separate bus container
+  master_index: 0         # standalone mode always uses index 0
+  peer_bus_addrs:         # where to find each peer's replication stream
+    site-a: "redis-a:6379"
+    site-b: "redis-b:6379"
+  stream_prefix: "repl:stream:"
+  consumer_group: "repl-consumers"
+  password: ""
+
+peers:
+  - "site-a"
+  - "site-b"
+
+replication:
+  batch_size: 100
+  apply_concurrency: 8
+  dedup_ttl_seconds: 5
+  max_in_flight: 1000
+
+coordinator:
+  port: 8080
+
+metrics:
+  port: 9090

@@ -1,0 +1,76 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────
+# Embedded bus mode — 3 standalone Redis instances, NO separate
+# bus container. Each agent uses its own Redis as the bus.
+#
+# Port layout (distinct from other compose files):
+#   redis-a  : 6401   agent-a coordinator: 8191  metrics: 9191
+#   redis-b  : 6402   agent-b coordinator: 8192  metrics: 9192
+#   redis-c  : 6403   agent-c coordinator: 8193  metrics: 9193
+#
+# Usage:
+#   docker compose -f docker/embedded/docker-compose.yml up --build -d
+# ─────────────────────────────────────────────────────────────
+
+services:
+  # ─── Site A ───
+  redis-a:
+    image: redis:7-alpine
+    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    ports: ["6401:6379"]
+    networks: [replnet]
+
+  agent-a:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/redibridge/agent.yaml"]
+    volumes:
+      - ../../config/embedded/agent-a.yaml:/etc/redibridge/agent.yaml:ro
+    ports: ["8191:8080", "9191:9090"]
+    depends_on: [redis-a]
+    networks: [replnet]
+    restart: unless-stopped
+
+  # ─── Site B ───
+  redis-b:
+    image: redis:7-alpine
+    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    ports: ["6402:6379"]
+    networks: [replnet]
+
+  agent-b:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/redibridge/agent.yaml"]
+    volumes:
+      - ../../config/embedded/agent-b.yaml:/etc/redibridge/agent.yaml:ro
+    ports: ["8192:8080", "9192:9090"]
+    depends_on: [redis-b]
+    networks: [replnet]
+    restart: unless-stopped
+
+  # ─── Site C ───
+  redis-c:
+    image: redis:7-alpine
+    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    ports: ["6403:6379"]
+    networks: [replnet]
+
+  agent-c:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/redibridge/agent.yaml"]
+    volumes:
+      - ../../config/embedded/agent-c.yaml:/etc/redibridge/agent.yaml:ro
+    ports: ["8193:8080", "9193:9090"]
+    depends_on: [redis-c]
+    networks: [replnet]
+    restart: unless-stopped
+
+networks:
+  replnet:
+    driver: bridge

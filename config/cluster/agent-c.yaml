@@ -1,0 +1,44 @@
+site_id: "cluster-c"
+
+cluster:
+  mode: "cluster"
+  masters:
+    - "redis-c-master1:6379"
+    - "redis-c-master2:6379"
+    - "redis-c-master3:6379"
+  password: ""
+  tls: false
+
+bus:
+  # --- Option 1: dedicated bus Redis instance (default) ---
+  mode: "standalone"
+  addr: "redis-bus:6379"
+
+  # --- Option 2: reuse one of this site's own masters as the bus ---
+  # mode: "embedded"
+  # master_index: 0          # 0 = redis-c-master1, 1 = master2, 2 = master3
+
+  # --- Option 3: HA bus via Redis Sentinel ---
+  # mode: "sentinel"
+  # sentinel_master: "bus-master"
+  # sentinel_addrs: ["sentinel1:26379", "sentinel2:26379", "sentinel3:26379"]
+
+  stream_prefix: "repl:stream:"
+  consumer_group: "repl-consumers"
+  password: ""
+
+peers:
+  - "cluster-a"
+  - "cluster-b"
+
+replication:
+  batch_size: 100
+  apply_concurrency: 8
+  dedup_ttl_seconds: 5
+  max_in_flight: 1000
+
+coordinator:
+  port: 8080
+
+metrics:
+  port: 9090
