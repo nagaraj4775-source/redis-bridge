@@ -19,7 +19,7 @@ type Consumer struct {
 	siteID       string
 	peers        []string
 	bus          bus.Bus
-	localClient  *redis.Client
+	localClient  redis.UniversalClient
 	applier      *applier.Applier
 	dedup        *dedup.Filter
 	clock        *hlc.HLC
@@ -42,7 +42,7 @@ func New(
 	siteID string,
 	peers []string,
 	b bus.Bus,
-	localClient *redis.Client,
+	localClient redis.UniversalClient,
 	app *applier.Applier,
 	dd *dedup.Filter,
 	clock *hlc.HLC,
@@ -80,16 +80,29 @@ func (c *Consumer) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 
 	for _, peer := range c.peers {
-		// Create consumer group for each peer — scoped to this site
-		if err := c.bus.EnsureGroup(ctx, peer, c.groupName()); err != nil {
-			c.logger.Error("failed to ensure consumer group",
-				zap.String("peer", peer), zap.Error(err))
-			continue
-		}
-
 		wg.Add(1)
 		go func(peerID string) {
 			defer wg.Done()
+			// Retry EnsureGroup with backoff — peer cluster may still be initialising.
+			backoff := 500 * time.Millisecond
+			for {
+				if err := c.bus.EnsureGroup(ctx, peerID, c.groupName()); err != nil {
+					c.logger.Error("failed to ensure consumer group, retrying",
+						zap.String("peer", peerID),
+						zap.Duration("backoff", backoff),
+						zap.Error(err))
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(backoff):
+					}
+					if backoff < 10*time.Second {
+						backoff *= 2
+					}
+					continue
+				}
+				break
+			}
 			c.consumePeer(ctx, peerID)
 		}(peer)
 	}
@@ -249,9 +262,25 @@ func (c *Consumer) processOne(ctx context.Context, peerID string, msg bus.Messag
 		return false // Don't ACK, retry later
 	}
 
+	// If meta is absent but the key already exists locally, the producer may not
+	// have written __meta yet (keyspace-event processing is async). Wait a short
+	// grace period and re-read so we don't incorrectly overwrite a newer local
+	// write that hasn't been stamped yet.
+	if localHLC == 0 {
+		exists, _ := c.localClient.Exists(ctx, delta.Key).Result()
+		if exists > 0 {
+			time.Sleep(40 * time.Millisecond)
+			localHLC, localSite, err = applier.ReadMeta(ctx, c.localClient, delta.Key)
+			if err != nil {
+				logger.Error("read meta retry failed", zap.String("key", delta.Key), zap.Error(err))
+				return false
+			}
+		}
+	}
+
 	accepted := false
 	if localHLC == 0 {
-		// No meta = first write, always accept
+		// No meta = genuinely first write, always accept
 		accepted = true
 	} else if delta.HLC > localHLC {
 		accepted = true

@@ -1,3 +1,17 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# SENTINEL — Redis Sentinel HA per site  +  dedicated Sentinel bus
+# ══════════════════════════════════════════════════════════════════════════════
+# Use when:
+#   • Each site needs automatic master failover (1 master + replicas + sentinels)
+#   • You want the replication bus to also be HA (backed by its own Sentinel set)
+#
+# Docker Compose : docker/sentinel/docker-compose.yml
+# Make target    : make up-sentinel
+# Redis per site : 1 master + 2 replicas + 3 sentinels per site
+# Bus            : dedicated Redis Sentinel cluster (bus-master + bus-sentinels)
+# Ports          : Masters 6381-6383 | Bus 6390 | API 8081-8083 | Metrics 9091-9093
+# ══════════════════════════════════════════════════════════════════════════════
+
 site_id: "cluster-a"
 
 cluster:

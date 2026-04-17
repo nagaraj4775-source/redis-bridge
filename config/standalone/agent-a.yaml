@@ -1,3 +1,17 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# STANDALONE — 1 Redis instance per site  +  dedicated bus Redis
+# ══════════════════════════════════════════════════════════════════════════════
+# Use when:
+#   • Each site has exactly ONE Redis instance (no HA, no sharding)
+#   • You are willing to run a separate "bus" Redis shared by all agents
+#
+# Docker Compose : docker/standalone/docker-compose.yml
+# Make target    : make up-standalone
+# Redis per site : redis-a / redis-b / redis-c  (each a single instance)
+# Bus            : redis-bus (one shared instance, all agents connect to it)
+# Ports          : Redis 6381-6383 | Bus 6390 | API 8081-8083 | Metrics 9091-9093
+# ══════════════════════════════════════════════════════════════════════════════
+
 site_id: "cluster-a"
 
 cluster:

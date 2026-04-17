@@ -1,3 +1,19 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# EMBEDDED BUS — 1 Redis instance per site,  NO dedicated bus container
+# ══════════════════════════════════════════════════════════════════════════════
+# Use when:
+#   • Each site has exactly ONE Redis instance
+#   • You do NOT want to run a separate bus Redis
+#   • Each site's own Redis hosts its replication stream (repl:stream:site-a)
+#   • Agents pull peer streams directly from each peer's Redis
+#
+# Docker Compose : docker/embedded/docker-compose.yml
+# Make target    : make up-embedded
+# Redis per site : redis-a / redis-b / redis-c  (data + stream on same instance)
+# Bus            : NONE — stream is embedded in each site's Redis
+# Ports          : Redis 6401-6403 | API 8191-8193 | Metrics 9191-9193
+# ══════════════════════════════════════════════════════════════════════════════
+
 site_id: "site-a"
 
 cluster:

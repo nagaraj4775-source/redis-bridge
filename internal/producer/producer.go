@@ -55,24 +55,29 @@ var trackedCommands = map[string]bool{
 
 // Producer listens for keyspace events on Redis masters and publishes deltas.
 type Producer struct {
-	siteID  string
-	masters []*redis.Client
-	bus     bus.Bus
-	clock   *hlc.HLC
-	dedup   *dedup.Filter
-	logger  *zap.Logger
-	seqNo   atomic.Uint64
+	siteID     string
+	masters    []*redis.Client      // per-node clients for PSubscribe only
+	dataClient redis.UniversalClient // for meta/shadow/reader ops (auto-routes in cluster)
+	bus        bus.Bus
+	clock      *hlc.HLC
+	dedup      *dedup.Filter
+	logger     *zap.Logger
+	seqNo      atomic.Uint64
 }
 
 // New creates a new Producer.
-func New(siteID string, masters []*redis.Client, b bus.Bus, clock *hlc.HLC, dd *dedup.Filter, logger *zap.Logger) *Producer {
+// masters are per-node standalone clients used only for PSubscribe (keyspace notifications
+// must be received on the specific node that owns the key's slot).
+// dataClient is used for all data operations and can be a ClusterClient for automatic routing.
+func New(siteID string, masters []*redis.Client, dataClient redis.UniversalClient, b bus.Bus, clock *hlc.HLC, dd *dedup.Filter, logger *zap.Logger) *Producer {
 	return &Producer{
-		siteID:  siteID,
-		masters: masters,
-		bus:     b,
-		clock:   clock,
-		dedup:   dd,
-		logger:  logger,
+		siteID:     siteID,
+		masters:    masters,
+		dataClient: dataClient,
+		bus:        b,
+		clock:      clock,
+		dedup:      dd,
+		logger:     logger,
 	}
 }
 
@@ -130,12 +135,12 @@ func (p *Producer) subscribeAndProcess(ctx context.Context, idx int, client *red
 			if !ok {
 				return fmt.Errorf("pubsub channel closed")
 			}
-			p.handleEvent(ctx, client, msg, logger)
+			p.handleEvent(ctx, msg, logger)
 		}
 	}
 }
 
-func (p *Producer) handleEvent(ctx context.Context, client *redis.Client, msg *redis.Message, logger *zap.Logger) {
+func (p *Producer) handleEvent(ctx context.Context, msg *redis.Message, logger *zap.Logger) {
 	// msg.Channel: __keyevent@0__:set
 	// msg.Payload: the key name
 	key := msg.Payload
@@ -152,7 +157,8 @@ func (p *Producer) handleEvent(ctx context.Context, client *redis.Client, msg *r
 		return
 	}
 
-	// Check if this is a replication write (loop prevention)
+	// Check if this is a replication write (loop prevention).
+	// Uses dataClient so shadow key lookup auto-routes in cluster mode.
 	applying, err := p.dedup.IsApplying(ctx, key)
 	if err != nil {
 		logger.Warn("dedup check failed", zap.String("key", key), zap.Error(err))
@@ -162,8 +168,8 @@ func (p *Producer) handleEvent(ctx context.Context, client *redis.Client, msg *r
 		return
 	}
 
-	// Read key value and TTL
-	keyType, value, err := reader.ReadValue(ctx, client, key)
+	// Read key value and TTL via dataClient (auto-routes to correct shard in cluster mode).
+	keyType, value, err := reader.ReadValue(ctx, p.dataClient, key)
 	if err != nil {
 		// Key might have been deleted between notification and read
 		if cmd == "del" {
@@ -175,7 +181,7 @@ func (p *Producer) handleEvent(ctx context.Context, client *redis.Client, msg *r
 		}
 	}
 
-	ttlMs, err := reader.ReadTTL(ctx, client, key)
+	ttlMs, err := reader.ReadTTL(ctx, p.dataClient, key)
 	if err != nil {
 		logger.Debug("failed to read TTL", zap.String("key", key), zap.Error(err))
 		ttlMs = -1
@@ -209,13 +215,12 @@ func (p *Producer) handleEvent(ctx context.Context, client *redis.Client, msg *r
 
 	// Write meta BEFORE publishing so the LWW anchor is visible to our own
 	// consumer before any peer can receive and process the delta.
-	// Without this ordering, a fast peer delta can arrive and be treated as
-	// "first write" (meta==nil) before our meta is set, causing divergence.
+	// Uses dataClient so the meta key auto-routes to its correct shard in cluster mode.
 	metaKey := "__meta:" + key
 	if keyType == "none" {
-		client.Del(ctx, metaKey)
+		p.dataClient.Del(ctx, metaKey)
 	} else {
-		metaCAS.Run(ctx, client, []string{metaKey}, strconv.FormatUint(ts, 10), p.siteID)
+		metaCAS.Run(ctx, p.dataClient, []string{metaKey}, strconv.FormatUint(ts, 10), p.siteID)
 	}
 
 	// Publish to bus

@@ -22,61 +22,92 @@ services:
   # ─── Site A Masters ───
   redis-a-master1:
     image: redis:7-alpine
-    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --notify-keyspace-events KEA --save "" --appendonly no
     ports: ["6411:6379"]
+    volumes: [redis-a-master1-data:/data]
     networks: [replnet]
 
   redis-a-master2:
     image: redis:7-alpine
-    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --notify-keyspace-events KEA --save "" --appendonly no
     ports: ["6412:6379"]
+    volumes: [redis-a-master2-data:/data]
     networks: [replnet]
 
   redis-a-master3:
     image: redis:7-alpine
-    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --notify-keyspace-events KEA --save "" --appendonly no
     ports: ["6413:6379"]
+    volumes: [redis-a-master3-data:/data]
     networks: [replnet]
 
   # ─── Site B Masters ───
   redis-b-master1:
     image: redis:7-alpine
-    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --notify-keyspace-events KEA --save "" --appendonly no
     ports: ["6414:6379"]
+    volumes: [redis-b-master1-data:/data]
     networks: [replnet]
 
   redis-b-master2:
     image: redis:7-alpine
-    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --notify-keyspace-events KEA --save "" --appendonly no
     ports: ["6415:6379"]
+    volumes: [redis-b-master2-data:/data]
     networks: [replnet]
 
   redis-b-master3:
     image: redis:7-alpine
-    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --notify-keyspace-events KEA --save "" --appendonly no
     ports: ["6416:6379"]
+    volumes: [redis-b-master3-data:/data]
     networks: [replnet]
 
   # ─── Site C Masters ───
   redis-c-master1:
     image: redis:7-alpine
-    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --notify-keyspace-events KEA --save "" --appendonly no
     ports: ["6417:6379"]
+    volumes: [redis-c-master1-data:/data]
     networks: [replnet]
 
   redis-c-master2:
     image: redis:7-alpine
-    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --notify-keyspace-events KEA --save "" --appendonly no
     ports: ["6418:6379"]
+    volumes: [redis-c-master2-data:/data]
     networks: [replnet]
 
   redis-c-master3:
     image: redis:7-alpine
-    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --notify-keyspace-events KEA --save "" --appendonly no
     ports: ["6419:6379"]
+    volumes: [redis-c-master3-data:/data]
     networks: [replnet]
 
-  # ─── Agent A (no bus dependency — embedded on redis-a-master1) ───
+  # ─── Cluster init — runs once to join nodes into a 3-master cluster per site ───
+  cluster-init-a:
+    image: redis:7-alpine
+    depends_on: [redis-a-master1, redis-a-master2, redis-a-master3]
+    restart: "no"
+    command: ["sh", "-c", "sleep 4 && redis-cli --cluster create redis-a-master1:6379 redis-a-master2:6379 redis-a-master3:6379 --cluster-replicas 0 --cluster-yes"]
+    networks: [replnet]
+
+  cluster-init-b:
+    image: redis:7-alpine
+    depends_on: [redis-b-master1, redis-b-master2, redis-b-master3]
+    restart: "no"
+    command: ["sh", "-c", "sleep 4 && redis-cli --cluster create redis-b-master1:6379 redis-b-master2:6379 redis-b-master3:6379 --cluster-replicas 0 --cluster-yes"]
+    networks: [replnet]
+
+  cluster-init-c:
+    image: redis:7-alpine
+    depends_on: [redis-c-master1, redis-c-master2, redis-c-master3]
+    restart: "no"
+    command: ["sh", "-c", "sleep 4 && redis-cli --cluster create redis-c-master1:6379 redis-c-master2:6379 redis-c-master3:6379 --cluster-replicas 0 --cluster-yes"]
+    networks: [replnet]
+
+  # ─── Agent A ───
   agent-a:
     build:
       context: ../..
@@ -85,7 +116,7 @@ services:
     volumes:
       - ../../config/embedded-cluster/agent-a.yaml:/etc/redibridge/agent.yaml:ro
     ports: ["8291:8080", "9291:9090"]
-    depends_on: [redis-a-master1, redis-a-master2, redis-a-master3]
+    depends_on: [cluster-init-a, cluster-init-b, cluster-init-c]
     networks: [replnet]
     restart: unless-stopped
 
@@ -98,7 +129,7 @@ services:
     volumes:
       - ../../config/embedded-cluster/agent-b.yaml:/etc/redibridge/agent.yaml:ro
     ports: ["8292:8080", "9292:9090"]
-    depends_on: [redis-b-master1, redis-b-master2, redis-b-master3]
+    depends_on: [cluster-init-a, cluster-init-b, cluster-init-c]
     networks: [replnet]
     restart: unless-stopped
 
@@ -111,10 +142,21 @@ services:
     volumes:
       - ../../config/embedded-cluster/agent-c.yaml:/etc/redibridge/agent.yaml:ro
     ports: ["8293:8080", "9293:9090"]
-    depends_on: [redis-c-master1, redis-c-master2, redis-c-master3]
+    depends_on: [cluster-init-a, cluster-init-b, cluster-init-c]
     networks: [replnet]
     restart: unless-stopped
 
 networks:
   replnet:
     driver: bridge
+
+volumes:
+  redis-a-master1-data:
+  redis-a-master2-data:
+  redis-a-master3-data:
+  redis-b-master1-data:
+  redis-b-master2-data:
+  redis-b-master3-data:
+  redis-c-master1-data:
+  redis-c-master2-data:
+  redis-c-master3-data:

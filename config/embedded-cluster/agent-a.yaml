@@ -1,3 +1,19 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# EMBEDDED BUS + CLUSTER — Redis Cluster per site,  NO dedicated bus container
+# ══════════════════════════════════════════════════════════════════════════════
+# Use when:
+#   • Each site runs a Redis Cluster (multiple masters, data is sharded)
+#   • You do NOT want to run a separate bus Redis
+#   • master1 of each site hosts the replication stream (repl:stream:ec-site-a)
+#   • Agents pull peer streams directly from each peer's master1
+#
+# Docker Compose : docker/embedded-cluster/docker-compose.yml
+# Make target    : make up-embedded-cluster
+# Redis per site : 3 masters per site — master1 also hosts the stream
+# Bus            : NONE — stream embedded on master1 of each site
+# Ports          : Redis 6411-6419 | API 8291-8293 | Metrics 9291-9293
+# ══════════════════════════════════════════════════════════════════════════════
+
 site_id: "ec-site-a"
 
 cluster:

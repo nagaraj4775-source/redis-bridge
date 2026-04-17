@@ -31,6 +31,7 @@ type Bus interface {
 	Ack(ctx context.Context, peerSiteID string, group string, ids []string) error
 	StreamLen(ctx context.Context, siteID string) (int64, error)
 	EnsureGroup(ctx context.Context, peerSiteID, group string) error
+	Ping(ctx context.Context) error
 	Close() error
 }
 
@@ -42,7 +43,7 @@ type Message struct {
 
 // RedisStreamsBus implements Bus using Redis Streams.
 type RedisStreamsBus struct {
-	client       *redis.Client
+	client       redis.UniversalClient
 	streamPrefix string
 	maxLen       int64
 	logger       *zap.Logger
@@ -88,9 +89,29 @@ func NewRedisStreamsBusSentinel(masterName string, sentinelAddrs []string, passw
 	}
 }
 
-// Client returns the underlying Redis client (for health checks).
-func (b *RedisStreamsBus) Client() *redis.Client {
-	return b.client
+// NewRedisStreamsBusCluster creates a bus backed by a Redis Cluster.
+// addrs is the list of cluster node addresses (bootstrap nodes); the client
+// discovers all nodes automatically.
+func NewRedisStreamsBusCluster(addrs []string, password, streamPrefix string, logger *zap.Logger) *RedisStreamsBus {
+	client := redis.NewClusterClient(&redis.ClusterOptions{
+		Addrs:        addrs,
+		Password:     password,
+		PoolSize:     32,
+		MinIdleConns: 4,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 5 * time.Second,
+	})
+	return &RedisStreamsBus{
+		client:       client,
+		streamPrefix: streamPrefix,
+		maxLen:       1000000,
+		logger:       logger,
+	}
+}
+
+// Ping checks connectivity to the underlying Redis instance.
+func (b *RedisStreamsBus) Ping(ctx context.Context) error {
+	return b.client.Ping(ctx).Err()
 }
 
 func (b *RedisStreamsBus) streamName(siteID string) string {

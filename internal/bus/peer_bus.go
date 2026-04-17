@@ -40,9 +40,19 @@ func NewPerPeerBus(localAddr string, peerAddrs map[string]string, password, stre
 	}
 }
 
-// RawLocalBus exposes the local RedisStreamsBus (needed by main.go for health ping).
-func (p *PerPeerBus) RawLocalBus() *RedisStreamsBus {
-	return p.local
+// NewPerPeerBusDirect builds a PerPeerBus from pre-constructed bus instances.
+// Used by main.go when the caller needs to choose standalone vs cluster bus clients.
+func NewPerPeerBusDirect(local *RedisStreamsBus, peers map[string]*RedisStreamsBus, logger *zap.Logger) *PerPeerBus {
+	return &PerPeerBus{
+		local:  local,
+		peers:  peers,
+		logger: logger,
+	}
+}
+
+// Ping checks connectivity to the local bus Redis instance.
+func (p *PerPeerBus) Ping(ctx context.Context) error {
+	return p.local.Ping(ctx)
 }
 
 // Publish writes the delta to this site's local stream.

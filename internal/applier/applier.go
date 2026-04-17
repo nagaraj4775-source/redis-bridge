@@ -18,13 +18,13 @@ const metaPrefix = "__meta:"
 
 // Applier applies accepted deltas to the local Redis cluster.
 type Applier struct {
-	client *redis.Client
+	client redis.UniversalClient
 	dedup  *dedup.Filter
 	logger *zap.Logger
 }
 
 // New creates a new Applier.
-func New(client *redis.Client, dedup *dedup.Filter, logger *zap.Logger) *Applier {
+func New(client redis.UniversalClient, dedup *dedup.Filter, logger *zap.Logger) *Applier {
 	return &Applier{
 		client: client,
 		dedup:  dedup,
@@ -146,7 +146,7 @@ func (a *Applier) Apply(ctx context.Context, delta bus.Delta) error {
 
 // ReadMeta reads the __meta:{key} hash for LWW comparison.
 // Returns hlc=0 and empty siteID if meta does not exist.
-func ReadMeta(ctx context.Context, client *redis.Client, key string) (hlc uint64, siteID string, err error) {
+func ReadMeta(ctx context.Context, client redis.UniversalClient, key string) (hlc uint64, siteID string, err error) {
 	metaKey := metaPrefix + key
 	vals, err := client.HGetAll(ctx, metaKey).Result()
 	if err != nil {

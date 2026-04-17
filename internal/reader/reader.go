@@ -16,7 +16,7 @@ type ZSetEntry struct {
 
 // ReadValue reads the full value of a key based on its type.
 // Returns the key type and JSON-encoded value bytes.
-func ReadValue(ctx context.Context, client *redis.Client, key string) (keyType string, value []byte, err error) {
+func ReadValue(ctx context.Context, client redis.UniversalClient, key string) (keyType string, value []byte, err error) {
 	t, err := client.Type(ctx, key).Result()
 	if err != nil {
 		return "", nil, fmt.Errorf("TYPE %s: %w", key, err)
@@ -91,7 +91,7 @@ func ReadValue(ctx context.Context, client *redis.Client, key string) (keyType s
 
 // ReadTTL reads the remaining TTL of a key in milliseconds.
 // Returns -1 if the key has no expiry, -2 if the key does not exist.
-func ReadTTL(ctx context.Context, client *redis.Client, key string) (int64, error) {
+func ReadTTL(ctx context.Context, client redis.UniversalClient, key string) (int64, error) {
 	ttl, err := client.PTTL(ctx, key).Result()
 	if err != nil {
 		return 0, fmt.Errorf("PTTL %s: %w", key, err)

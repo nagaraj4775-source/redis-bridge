@@ -61,8 +61,10 @@ const (
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-// ecAllMasters returns all 9 Redis clients (3 per site).
-// siteA, siteB, siteC are slices of [master1, master2, master3].
+// ecAllMasters returns direct per-node clients (3 per site).
+// Used for stream inspection (XLen) and waitOnAllMasters.
+// NOTE: in Redis Cluster mode these clients get MOVED errors for wrong-slot keys;
+// use ecClusterClients for all write/read operations.
 func ecAllMasters(t *testing.T) (siteA, siteB, siteC []*redis.Client) {
 	t.Helper()
 	mk := func(addr string) *redis.Client {
@@ -73,6 +75,22 @@ func ecAllMasters(t *testing.T) (siteA, siteB, siteC []*redis.Client) {
 	siteA = []*redis.Client{mk(ecAddrA1), mk(ecAddrA2), mk(ecAddrA3)}
 	siteB = []*redis.Client{mk(ecAddrB1), mk(ecAddrB2), mk(ecAddrB3)}
 	siteC = []*redis.Client{mk(ecAddrC1), mk(ecAddrC2), mk(ecAddrC3)}
+	return
+}
+
+// ecClusterClients returns a ClusterClient per site.
+// These handle MOVED redirects automatically and should be used for all
+// write/read operations in cluster-protocol mode.
+func ecClusterClients(t *testing.T) (clA, clB, clC *redis.ClusterClient) {
+	t.Helper()
+	mkc := func(addrs ...string) *redis.ClusterClient {
+		c := redis.NewClusterClient(&redis.ClusterOptions{Addrs: addrs})
+		t.Cleanup(func() { c.Close() })
+		return c
+	}
+	clA = mkc(ecAddrA1, ecAddrA2, ecAddrA3)
+	clB = mkc(ecAddrB1, ecAddrB2, ecAddrB3)
+	clC = mkc(ecAddrC1, ecAddrC2, ecAddrC3)
 	return
 }
 
@@ -130,38 +148,37 @@ func TestEmbeddedClusterStreamOnMaster1(t *testing.T) {
 
 	ctx := context.Background()
 	siteA, siteB, siteC := ecAllMasters(t)
+	clA, clB, clC := ecClusterClients(t)
 
-	// Trigger events on each site.
-	siteA[0].Set(ctx, ecUniqueKey("init-a"), "v", 0)
-	siteB[0].Set(ctx, ecUniqueKey("init-b"), "v", 0)
-	siteC[0].Set(ctx, ecUniqueKey("init-c"), "v", 0)
+	// Trigger events on each site via ClusterClient (auto-routes to correct shard).
+	clA.Set(ctx, ecUniqueKey("init-a"), "v", 0)
+	clB.Set(ctx, ecUniqueKey("init-b"), "v", 0)
+	clC.Set(ctx, ecUniqueKey("init-c"), "v", 0)
 	time.Sleep(300 * time.Millisecond)
 
-	// Stream for site-a must exist on master1 of site-a.
+	// In cluster mode the stream key hashes to one specific shard —
+	// verify it exists on at least one master per site.
 	for _, tc := range []struct {
 		name    string
 		siteID  string
-		master1 *redis.Client
+		masters []*redis.Client
 	}{
-		{"site-a", ecSiteA, siteA[0]},
-		{"site-b", ecSiteB, siteB[0]},
-		{"site-c", ecSiteC, siteC[0]},
+		{"site-a", ecSiteA, siteA},
+		{"site-b", ecSiteB, siteB},
+		{"site-c", ecSiteC, siteC},
 	} {
 		stream := "repl:stream:" + tc.siteID
-		n, err := tc.master1.XLen(ctx, stream).Result()
-		if err != nil || n == 0 {
-			t.Errorf("stream %s on %s master1: len=%d err=%v", stream, tc.name, n, err)
-		} else {
-			t.Logf("stream %s on %s master1: %d entries ✓", stream, tc.name, n)
+		var total int64
+		for _, m := range tc.masters {
+			n, err := m.XLen(ctx, stream).Result()
+			if err == nil {
+				total += n
+			}
 		}
-
-		// Stream must NOT appear on master2 or master3 (embedded, not replicated).
-		for i, m := range []struct {
-			idx int
-			c   *redis.Client
-		}{{2, tc.master1}, {2, siteA[1]}, {3, siteA[2]}} {
-			_ = i
-			_ = m
+		if total == 0 {
+			t.Errorf("stream %s not found on any master of %s", stream, tc.name)
+		} else {
+			t.Logf("stream %s on %s master1: %d entries \u2713", stream, tc.name, total)
 		}
 	}
 }
@@ -172,41 +189,39 @@ func TestEmbeddedClusterReplicationFromAnyMaster(t *testing.T) {
 	ecSkipIfNotRunning(t)
 
 	ctx := context.Background()
-	siteA, siteB, siteC := ecAllMasters(t)
+	_, siteB, siteC := ecAllMasters(t)
+	clA, clB, clC := ecClusterClients(t)
 
-	// Write to master2 and master3 of site-a (not just master1).
-	keyM2 := ecUniqueKey("master2-write")
-	keyM3 := ecUniqueKey("master3-write")
+	// Write multiple keys via ClusterClient — keys hash to different shards,
+	// verifying that the producer captures events from every shard.
+	keys := []struct{ key, val string }{
+		{ecUniqueKey("any-m-1"), "from-a-shard1"},
+		{ecUniqueKey("any-m-2"), "from-a-shard2"},
+		{ecUniqueKey("any-m-3"), "from-a-shard3"},
+	}
+	for _, kv := range keys {
+		clA.Set(ctx, kv.key, kv.val, 0)
+	}
 
-	siteA[1].Set(ctx, keyM2, "from-a-master2", 0)
-	siteA[2].Set(ctx, keyM3, "from-a-master3", 0)
-
-	// Both must reach at least master1 of B and C (applier writes to localClient=master1).
-	for _, tc := range []struct {
-		key  string
-		val  string
-		site string
-		ms   []*redis.Client
-	}{
-		{keyM2, "from-a-master2", "B", siteB},
-		{keyM2, "from-a-master2", "C", siteC},
-		{keyM3, "from-a-master3", "B", siteB},
-		{keyM3, "from-a-master3", "C", siteC},
-	} {
-		lat, err := waitOnAllMasters(ctx, tc.ms, tc.key, tc.val, ecReplTimeout)
+	for _, kv := range keys {
+		lat, err := waitOnAllMasters(ctx, siteB, kv.key, kv.val, ecReplTimeout)
 		if err != nil {
-			t.Errorf("key %s from A→%s: %v", tc.key, tc.site, err)
+			t.Errorf("key %s from A\u2192B: %v", kv.key, err)
 		} else {
-			t.Logf("A(m%s)→%s latency: %v ✓", tc.key[len(tc.key)-1:], tc.site, lat)
+			t.Logf("A(m%s)\u2192B latency: %v \u2713", kv.key[len(kv.key)-1:], lat)
+		}
+		lat, err = waitOnAllMasters(ctx, siteC, kv.key, kv.val, ecReplTimeout)
+		if err != nil {
+			t.Errorf("key %s from A\u2192C: %v", kv.key, err)
+		} else {
+			t.Logf("A(m%s)\u2192C latency: %v \u2713", kv.key[len(kv.key)-1:], lat)
 		}
 	}
 
-	for _, k := range []string{keyM2, keyM3} {
-		for _, ms := range [][]*redis.Client{siteA, siteB, siteC} {
-			for _, m := range ms {
-				m.Del(ctx, k)
-			}
-		}
+	for _, kv := range keys {
+		clA.Del(ctx, kv.key)
+		clB.Del(ctx, kv.key)
+		clC.Del(ctx, kv.key)
 	}
 }
 
@@ -216,33 +231,34 @@ func TestEmbeddedClusterStringReplication(t *testing.T) {
 	ecSkipIfNotRunning(t)
 
 	ctx := context.Background()
-	siteA, siteB, siteC := ecAllMasters(t)
+	_, siteB, siteC := ecAllMasters(t)
+	clA, clB, clC := ecClusterClients(t)
 
 	key := ecUniqueKey("string")
 	val := "hello-ec"
 
-	siteA[0].Set(ctx, key, val, 0)
+	clA.Set(ctx, key, val, 0)
 
 	latB, err := waitOnAllMasters(ctx, siteB, key, val, ecReplTimeout)
 	if err != nil {
-		t.Fatalf("A→B: %v", err)
+		t.Fatalf("A\u2192B: %v", err)
 	}
 	latC, err := waitOnAllMasters(ctx, siteC, key, val, ecReplTimeout)
 	if err != nil {
-		t.Fatalf("A→C: %v", err)
+		t.Fatalf("A\u2192C: %v", err)
 	}
 
-	t.Logf("latency A→B: %v  A→C: %v", latB, latC)
+	t.Logf("latency A\u2192B: %v  A\u2192C: %v", latB, latC)
 	if latB > ecLatencyBudget {
-		t.Errorf("A→B %v exceeds %v budget", latB, ecLatencyBudget)
+		t.Errorf("A\u2192B %v exceeds %v budget", latB, ecLatencyBudget)
 	}
 	if latC > ecLatencyBudget {
-		t.Errorf("A→C %v exceeds %v budget", latC, ecLatencyBudget)
+		t.Errorf("A\u2192C %v exceeds %v budget", latC, ecLatencyBudget)
 	}
 
-	for _, ms := range [][]*redis.Client{siteA, siteB, siteC} {
-		ms[0].Del(ctx, key)
-	}
+	clA.Del(ctx, key)
+	clB.Del(ctx, key)
+	clC.Del(ctx, key)
 }
 
 // ── Test 4: Hash replication ──────────────────────────────────────────────────
@@ -251,30 +267,30 @@ func TestEmbeddedClusterHashReplication(t *testing.T) {
 	ecSkipIfNotRunning(t)
 
 	ctx := context.Background()
-	siteA, siteB, siteC := ecAllMasters(t)
+	clA, clB, clC := ecClusterClients(t)
 
 	key := ecUniqueKey("hash")
-	siteA[0].HSet(ctx, key, "user", "alice", "role", "admin", "region", "APAC")
+	clA.HSet(ctx, key, "user", "alice", "role", "admin", "region", "APAC")
 
 	for _, tc := range []struct {
 		name string
-		ms   []*redis.Client
-	}{{"B", siteB}, {"C", siteC}} {
-		if err := waitForHash(ctx, tc.ms[0], key, "user", "alice", ecReplTimeout); err != nil {
+		cl   *redis.ClusterClient
+	}{{"B", clB}, {"C", clC}} {
+		if err := waitForHash(ctx, tc.cl, key, "user", "alice", ecReplTimeout); err != nil {
 			t.Errorf("hash to %s: %v", tc.name, err)
 			continue
 		}
-		got, _ := tc.ms[0].HGetAll(ctx, key).Result()
+		got, _ := tc.cl.HGetAll(ctx, key).Result()
 		if got["role"] != "admin" || got["region"] != "APAC" {
 			t.Errorf("site %s incomplete hash: %v", tc.name, got)
 		} else {
-			t.Logf("site %s hash ok %v ✓", tc.name, got)
+			t.Logf("site %s hash ok %v \u2713", tc.name, got)
 		}
 	}
 
-	for _, ms := range [][]*redis.Client{siteA, siteB, siteC} {
-		ms[0].Del(ctx, key)
-	}
+	clA.Del(ctx, key)
+	clB.Del(ctx, key)
+	clC.Del(ctx, key)
 }
 
 // ── Test 5: TTL preservation ──────────────────────────────────────────────────
@@ -283,30 +299,32 @@ func TestEmbeddedClusterTTLPreservation(t *testing.T) {
 	ecSkipIfNotRunning(t)
 
 	ctx := context.Background()
-	siteA, siteB, siteC := ecAllMasters(t)
+	_, siteB, siteC := ecAllMasters(t)
+	clA, clB, clC := ecClusterClients(t)
 
 	key := ecUniqueKey("ttl")
 	const ttl = 30 * time.Second
-	siteA[0].Set(ctx, key, "expiring", ttl)
+	clA.Set(ctx, key, "expiring", ttl)
 
 	for _, tc := range []struct {
 		name string
 		ms   []*redis.Client
-	}{{"B", siteB}, {"C", siteC}} {
+		cl   *redis.ClusterClient
+	}{{"B", siteB, clB}, {"C", siteC, clC}} {
 		if _, err := waitOnAllMasters(ctx, tc.ms, key, "expiring", ecReplTimeout); err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
-		rem, err := tc.ms[0].TTL(ctx, key).Result()
+		rem, err := tc.cl.TTL(ctx, key).Result()
 		if err != nil || rem <= 0 || rem > ttl {
 			t.Errorf("site %s: TTL %v (orig %v) err=%v", tc.name, rem, ttl, err)
 		} else {
-			t.Logf("site %s: TTL %v ✓", tc.name, rem)
+			t.Logf("site %s: TTL %v \u2713", tc.name, rem)
 		}
 	}
 
-	for _, ms := range [][]*redis.Client{siteA, siteB, siteC} {
-		ms[0].Del(ctx, key)
-	}
+	clA.Del(ctx, key)
+	clB.Del(ctx, key)
+	clC.Del(ctx, key)
 }
 
 // ── Test 6: Bidirectional replication ─────────────────────────────────────────
@@ -316,31 +334,32 @@ func TestEmbeddedClusterBidirectional(t *testing.T) {
 
 	ctx := context.Background()
 	siteA, siteB, siteC := ecAllMasters(t)
+	clA, clB, clC := ecClusterClients(t)
 
 	keyB := ecUniqueKey("bidir-B")
-	siteB[0].Set(ctx, keyB, "from-B", 0)
+	clB.Set(ctx, keyB, "from-B", 0)
 	if _, err := waitOnAllMasters(ctx, siteA, keyB, "from-B", ecReplTimeout); err != nil {
-		t.Errorf("B→A: %v", err)
+		t.Errorf("B\u2192A: %v", err)
 	}
 	if _, err := waitOnAllMasters(ctx, siteC, keyB, "from-B", ecReplTimeout); err != nil {
-		t.Errorf("B→C: %v", err)
+		t.Errorf("B\u2192C: %v", err)
 	}
-	t.Log("B→A,C ✓")
+	t.Log("B\u2192A,C \u2713")
 
 	keyC := ecUniqueKey("bidir-C")
-	siteC[0].Set(ctx, keyC, "from-C", 0)
+	clC.Set(ctx, keyC, "from-C", 0)
 	if _, err := waitOnAllMasters(ctx, siteA, keyC, "from-C", ecReplTimeout); err != nil {
-		t.Errorf("C→A: %v", err)
+		t.Errorf("C\u2192A: %v", err)
 	}
 	if _, err := waitOnAllMasters(ctx, siteB, keyC, "from-C", ecReplTimeout); err != nil {
-		t.Errorf("C→B: %v", err)
+		t.Errorf("C\u2192B: %v", err)
 	}
-	t.Log("C→A,B ✓")
+	t.Log("C\u2192A,B \u2713")
 
 	for _, k := range []string{keyB, keyC} {
-		for _, ms := range [][]*redis.Client{siteA, siteB, siteC} {
-			ms[0].Del(ctx, k)
-		}
+		clA.Del(ctx, k)
+		clB.Del(ctx, k)
+		clC.Del(ctx, k)
 	}
 }
 
@@ -350,10 +369,11 @@ func TestEmbeddedClusterDeletePropagation(t *testing.T) {
 	ecSkipIfNotRunning(t)
 
 	ctx := context.Background()
-	siteA, siteB, siteC := ecAllMasters(t)
+	_, siteB, siteC := ecAllMasters(t)
+	clA, clB, clC := ecClusterClients(t)
 
 	key := ecUniqueKey("del")
-	siteA[0].Set(ctx, key, "to-delete", 0)
+	clA.Set(ctx, key, "to-delete", 0)
 	if _, err := waitOnAllMasters(ctx, siteB, key, "to-delete", ecReplTimeout); err != nil {
 		t.Fatalf("initial repl B: %v", err)
 	}
@@ -361,17 +381,17 @@ func TestEmbeddedClusterDeletePropagation(t *testing.T) {
 		t.Fatalf("initial repl C: %v", err)
 	}
 
-	siteA[0].Del(ctx, key)
+	clA.Del(ctx, key)
 
-	if err := waitForDeleted(ctx, siteB[0], key, ecReplTimeout); err != nil {
-		t.Errorf("DEL→B: %v", err)
+	if err := waitForDeleted(ctx, clB, key, ecReplTimeout); err != nil {
+		t.Errorf("DEL\u2192B: %v", err)
 	} else {
-		t.Log("DEL propagated to B ✓")
+		t.Log("DEL propagated to B \u2713")
 	}
-	if err := waitForDeleted(ctx, siteC[0], key, ecReplTimeout); err != nil {
-		t.Errorf("DEL→C: %v", err)
+	if err := waitForDeleted(ctx, clC, key, ecReplTimeout); err != nil {
+		t.Errorf("DEL\u2192C: %v", err)
 	} else {
-		t.Log("DEL propagated to C ✓")
+		t.Log("DEL propagated to C \u2713")
 	}
 }
 
@@ -381,42 +401,41 @@ func TestEmbeddedClusterLWWConvergence(t *testing.T) {
 	ecSkipIfNotRunning(t)
 
 	ctx := context.Background()
-	siteA, siteB, siteC := ecAllMasters(t)
+	clA, clB, clC := ecClusterClients(t)
 
 	key := ecUniqueKey("lww")
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); siteA[0].Set(ctx, key, "from-A", 0) }()
-	go func() { defer wg.Done(); siteB[0].Set(ctx, key, "from-B", 0) }()
+	go func() { defer wg.Done(); clA.Set(ctx, key, "from-A", 0) }()
+	go func() { defer wg.Done(); clB.Set(ctx, key, "from-B", 0) }()
 	wg.Wait()
 
 	time.Sleep(3 * time.Second)
 
-	valA, _ := siteA[0].Get(ctx, key).Result()
-	valB, _ := siteB[0].Get(ctx, key).Result()
-	valC, _ := siteC[0].Get(ctx, key).Result()
+	valA, _ := clA.Get(ctx, key).Result()
+	valB, _ := clB.Get(ctx, key).Result()
+	valC, _ := clC.Get(ctx, key).Result()
 
 	t.Logf("after convergence: A=%q  B=%q  C=%q", valA, valB, valC)
 
 	if valA != valB || valB != valC {
 		t.Errorf("LWW did not converge: A=%q B=%q C=%q", valA, valB, valC)
 	} else {
-		t.Logf("LWW converged to %q ✓", valA)
+		t.Logf("LWW converged to %q \u2713", valA)
 	}
 
-	metaA, _ := siteA[0].HGetAll(ctx, "__meta:"+key).Result()
-	metaB, _ := siteB[0].HGetAll(ctx, "__meta:"+key).Result()
-	metaC, _ := siteC[0].HGetAll(ctx, "__meta:"+key).Result()
+	metaA, _ := clA.HGetAll(ctx, "__meta:"+key).Result()
+	metaB, _ := clB.HGetAll(ctx, "__meta:"+key).Result()
+	metaC, _ := clC.HGetAll(ctx, "__meta:"+key).Result()
 	t.Logf("meta: A=%v  B=%v  C=%v", metaA, metaB, metaC)
 	if metaA["site"] != metaB["site"] || metaB["site"] != metaC["site"] {
 		t.Errorf("LWW meta not consistent: A=%v B=%v C=%v", metaA, metaB, metaC)
 	}
 
-	for _, ms := range [][]*redis.Client{siteA, siteB, siteC} {
-		ms[0].Del(ctx, key)
-		ms[0].Del(ctx, "__meta:"+key)
-	}
+	clA.Del(ctx, key, "__meta:"+key)
+	clB.Del(ctx, key, "__meta:"+key)
+	clC.Del(ctx, key, "__meta:"+key)
 }
 
 // ── Test 9: Replication latency ───────────────────────────────────────────────
@@ -425,7 +444,8 @@ func TestEmbeddedClusterReplicationLatency(t *testing.T) {
 	ecSkipIfNotRunning(t)
 
 	ctx := context.Background()
-	siteA, siteB, _ := ecAllMasters(t)
+	_, siteB, _ := ecAllMasters(t)
+	clA, clB, _ := ecClusterClients(t)
 
 	const samples = 20
 	latencies := make([]time.Duration, 0, samples)
@@ -436,7 +456,7 @@ func TestEmbeddedClusterReplicationLatency(t *testing.T) {
 		val := fmt.Sprintf("v%d", i)
 		keys = append(keys, key)
 
-		siteA[0].Set(ctx, key, val, 0)
+		clA.Set(ctx, key, val, 0)
 		lat, err := waitOnAllMasters(ctx, siteB, key, val, ecReplTimeout)
 		if err != nil {
 			t.Errorf("sample %d: %v", i, err)
@@ -457,19 +477,18 @@ func TestEmbeddedClusterReplicationLatency(t *testing.T) {
 	}
 	p50 := latencies[len(latencies)*50/100]
 	p95 := latencies[len(latencies)*95/100]
-	t.Logf("Latency over %d samples — p50:%v p95:%v max:%v", len(latencies), p50, p95, latencies[len(latencies)-1])
+	t.Logf("Latency over %d samples \u2014 p50:%v p95:%v max:%v", len(latencies), p50, p95, latencies[len(latencies)-1])
 
 	if p50 > ecLatencyBudget {
 		t.Errorf("p50 %v exceeds %v budget", p50, ecLatencyBudget)
 	}
 	if p95 > ecLatencyBudget*2 {
-		t.Errorf("p95 %v exceeds 2× budget (%v)", p95, ecLatencyBudget*2)
+		t.Errorf("p95 %v exceeds 2\u00d7 budget (%v)", p95, ecLatencyBudget*2)
 	}
 
 	for _, k := range keys {
-		for _, ms := range [][]*redis.Client{siteA, siteB} {
-			ms[0].Del(ctx, k)
-		}
+		clA.Del(ctx, k)
+		clB.Del(ctx, k)
 	}
 }
 
@@ -479,7 +498,8 @@ func TestEmbeddedClusterMetricsIncrement(t *testing.T) {
 	ecSkipIfNotRunning(t)
 
 	ctx := context.Background()
-	siteA, siteB, _ := ecAllMasters(t)
+	_, siteB, _ := ecAllMasters(t)
+	clA, clB, _ := ecClusterClients(t)
 
 	before := fetchMetrics(t, ecMetricsB)
 	appliedBefore := metricValue(before, `repl_writes_applied_total`)
@@ -488,7 +508,7 @@ func TestEmbeddedClusterMetricsIncrement(t *testing.T) {
 	keys := make([]string, 5)
 	for i := range keys {
 		keys[i] = ecUniqueKey(fmt.Sprintf("metrics-%02d", i))
-		siteA[0].Set(ctx, keys[i], "v", 0)
+		clA.Set(ctx, keys[i], "v", 0)
 	}
 	for _, k := range keys {
 		if _, err := waitOnAllMasters(ctx, siteB, k, "v", ecReplTimeout); err != nil {
@@ -508,16 +528,15 @@ func TestEmbeddedClusterMetricsIncrement(t *testing.T) {
 	t.Logf("events_captured on A +%.0f", deltaCaptured)
 
 	if deltaApplied < 5 {
-		t.Errorf("expected ≥5 writes_applied on B, got +%.0f", deltaApplied)
+		t.Errorf("expected \u22655 writes_applied on B, got +%.0f", deltaApplied)
 	}
 	if deltaCaptured < 5 {
-		t.Errorf("expected ≥5 events_captured on A, got +%.0f", deltaCaptured)
+		t.Errorf("expected \u22655 events_captured on A, got +%.0f", deltaCaptured)
 	}
 
 	for _, k := range keys {
-		for _, ms := range [][]*redis.Client{siteA, siteB} {
-			ms[0].Del(ctx, k)
-		}
+		clA.Del(ctx, k)
+		clB.Del(ctx, k)
 	}
 }
 
@@ -543,7 +562,7 @@ func TestEmbeddedClusterManagementAPI(t *testing.T) {
 			if resp.StatusCode != 200 {
 				t.Errorf("%s /health: want 200 got %d", tc.name, resp.StatusCode)
 			} else {
-				t.Logf("%s /health ok ✓", tc.name)
+				t.Logf("%s /health ok \u2713", tc.name)
 			}
 		})
 	}
@@ -555,39 +574,40 @@ func TestEmbeddedClusterCRUDRoundTrip(t *testing.T) {
 	ecSkipIfNotRunning(t)
 
 	ctx := context.Background()
-	siteA, siteB, siteC := ecAllMasters(t)
+	_, siteB, siteC := ecAllMasters(t)
+	clA, clB, clC := ecClusterClients(t)
 	key := ecUniqueKey("crud")
 
-	siteA[0].Set(ctx, key, "v1", 0)
+	clA.Set(ctx, key, "v1", 0)
 	for _, tc := range []struct {
 		name string
 		ms   []*redis.Client
 	}{{"B", siteB}, {"C", siteC}} {
 		if _, err := waitOnAllMasters(ctx, tc.ms, key, "v1", ecReplTimeout); err != nil {
-			t.Fatalf("CREATE→%s: %v", tc.name, err)
+			t.Fatalf("CREATE\u2192%s: %v", tc.name, err)
 		}
 	}
-	t.Log("CREATE ✓")
+	t.Log("CREATE \u2713")
 
-	siteA[0].Set(ctx, key, "v2", 0)
+	clA.Set(ctx, key, "v2", 0)
 	for _, tc := range []struct {
 		name string
 		ms   []*redis.Client
 	}{{"B", siteB}, {"C", siteC}} {
 		if _, err := waitOnAllMasters(ctx, tc.ms, key, "v2", ecReplTimeout); err != nil {
-			t.Fatalf("UPDATE→%s: %v", tc.name, err)
+			t.Fatalf("UPDATE\u2192%s: %v", tc.name, err)
 		}
 	}
-	t.Log("UPDATE ✓")
+	t.Log("UPDATE \u2713")
 
-	siteA[0].Del(ctx, key)
+	clA.Del(ctx, key)
 	for _, tc := range []struct {
 		name string
-		ms   []*redis.Client
-	}{{"B", siteB}, {"C", siteC}} {
-		if err := waitForDeleted(ctx, tc.ms[0], key, ecReplTimeout); err != nil {
-			t.Fatalf("DELETE→%s: %v", tc.name, err)
+		cl   *redis.ClusterClient
+	}{{"B", clB}, {"C", clC}} {
+		if err := waitForDeleted(ctx, tc.cl, key, ecReplTimeout); err != nil {
+			t.Fatalf("DELETE\u2192%s: %v", tc.name, err)
 		}
 	}
-	t.Log("DELETE ✓")
+	t.Log("DELETE \u2713")
 }

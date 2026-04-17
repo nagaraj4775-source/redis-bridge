@@ -58,14 +58,13 @@ func main() {
 		cancel()
 	}()
 
-	// Create Redis clients based on cluster mode
-	masters, err := buildClusterClients(ctx, cfg, logger)
+	// Create Redis clients based on cluster mode.
+	// masters: per-node *redis.Client used only for PSubscribe (keyspace notifications).
+	// localClient: redis.UniversalClient for all data operations; ClusterClient in cluster mode.
+	masters, localClient, err := buildClusterClients(ctx, cfg, logger)
 	if err != nil {
 		logger.Fatal("failed to build cluster clients", zap.Error(err))
 	}
-
-	// Use first client as the local client for consumer/applier operations
-	localClient := masters[0]
 
 	// Create HLC
 	clock := hlc.New()
@@ -93,7 +92,7 @@ func main() {
 	app := applier.New(localClient, dd, logger)
 
 	// Create producer
-	prod := producer.New(cfg.SiteID, masters, replBus, clock, dd, logger)
+	prod := producer.New(cfg.SiteID, masters, localClient, replBus, clock, dd, logger)
 
 	// Create consumer
 	cons := consumer.New(
@@ -174,9 +173,13 @@ func main() {
 
 	wg.Wait()
 
-	// Cleanup
+	// Cleanup — close per-node pubsub clients
 	for _, m := range masters {
 		m.Close()
+	}
+	// Close localClient only when it is not one of the per-node clients (cluster mode)
+	if len(masters) == 0 || localClient != redis.UniversalClient(masters[0]) {
+		localClient.Close()
 	}
 	if err := replBus.Close(); err != nil {
 		logger.Warn("bus close error", zap.Error(err))
@@ -187,10 +190,10 @@ func main() {
 
 // buildClusterClients creates Redis clients based on the cluster mode in config.
 //
-//   - standalone: one client to a single Redis instance
-//   - sentinel:   one FailoverClient that auto-follows the Sentinel master
-//   - cluster:    one client per shard master (current default)
-func buildClusterClients(ctx context.Context, cfg *config.Config, logger *zap.Logger) ([]*redis.Client, error) {
+//   - standalone: one *redis.Client; localClient is the same instance
+//   - sentinel:   one FailoverClient that auto-follows the master; localClient is the same
+//   - cluster:    one *redis.Client per shard master for PSubscribe + a ClusterClient as localClient
+func buildClusterClients(ctx context.Context, cfg *config.Config, logger *zap.Logger) ([]*redis.Client, redis.UniversalClient, error) {
 	opts := &redis.Options{
 		Password:     cfg.Cluster.Password,
 		PoolSize:     32,
@@ -204,10 +207,10 @@ func buildClusterClients(ctx context.Context, cfg *config.Config, logger *zap.Lo
 		opts.Addr = cfg.Cluster.Addr
 		c := redis.NewClient(opts)
 		if err := c.Ping(ctx).Err(); err != nil {
-			return nil, fmt.Errorf("ping standalone %s: %w", cfg.Cluster.Addr, err)
+			return nil, nil, fmt.Errorf("ping standalone %s: %w", cfg.Cluster.Addr, err)
 		}
 		logger.Info("connected to standalone redis", zap.String("addr", cfg.Cluster.Addr))
-		return []*redis.Client{c}, nil
+		return []*redis.Client{c}, c, nil
 
 	case config.ModeSentinel:
 		c := redis.NewFailoverClient(&redis.FailoverOptions{
@@ -220,29 +223,44 @@ func buildClusterClients(ctx context.Context, cfg *config.Config, logger *zap.Lo
 			WriteTimeout:  3 * time.Second,
 		})
 		if err := c.Ping(ctx).Err(); err != nil {
-			return nil, fmt.Errorf("ping sentinel master %s: %w", cfg.Cluster.SentinelMaster, err)
+			return nil, nil, fmt.Errorf("ping sentinel master %s: %w", cfg.Cluster.SentinelMaster, err)
 		}
 		logger.Info("connected via sentinel",
 			zap.String("master", cfg.Cluster.SentinelMaster),
 			zap.Strings("sentinels", cfg.Cluster.SentinelAddrs))
-		return []*redis.Client{c}, nil
+		return []*redis.Client{c}, c, nil
 
 	case config.ModeCluster:
-		clients := make([]*redis.Client, len(cfg.Cluster.Masters))
+		// Per-node standalone clients for PSubscribe (keyspace notifications are
+		// node-local in cluster mode — the event is emitted by the owning shard).
+		pubsubClients := make([]*redis.Client, len(cfg.Cluster.Masters))
 		for i, addr := range cfg.Cluster.Masters {
-			opts.Addr = addr
-			optsCopy := *opts // copy per-client to avoid shared mutation
+			optsCopy := *opts
+			optsCopy.Addr = addr
 			c := redis.NewClient(&optsCopy)
 			if err := c.Ping(ctx).Err(); err != nil {
-				return nil, fmt.Errorf("ping master %s: %w", addr, err)
+				return nil, nil, fmt.Errorf("ping master %s: %w", addr, err)
 			}
-			clients[i] = c
-			logger.Info("connected to cluster master", zap.String("addr", addr))
+			pubsubClients[i] = c
+			logger.Info("connected to cluster master (pubsub)", zap.String("addr", addr))
 		}
-		return clients, nil
+		// ClusterClient for all data operations — handles MOVED redirects automatically.
+		cc := redis.NewClusterClient(&redis.ClusterOptions{
+			Addrs:        cfg.Cluster.Masters,
+			Password:     cfg.Cluster.Password,
+			PoolSize:     32,
+			MinIdleConns: 4,
+			ReadTimeout:  3 * time.Second,
+			WriteTimeout: 3 * time.Second,
+		})
+		if err := cc.Ping(ctx).Err(); err != nil {
+			return nil, nil, fmt.Errorf("ping cluster client: %w", err)
+		}
+		logger.Info("connected to redis cluster", zap.Strings("masters", cfg.Cluster.Masters))
+		return pubsubClients, cc, nil
 
 	default:
-		return nil, fmt.Errorf("unknown cluster mode: %s", cfg.Cluster.Mode)
+		return nil, nil, fmt.Errorf("unknown cluster mode: %s", cfg.Cluster.Mode)
 	}
 }
 
@@ -262,10 +280,21 @@ func buildBusClient(cfg *config.Config, logger *zap.Logger) (bus.Bus, error) {
 		), nil
 
 	case config.ModeBusEmbedded:
-		localAddr := resolvedBusAddr(cfg)
 		logger.Info("bus using embedded mode",
-			zap.String("local_addr", localAddr),
 			zap.Any("peer_addrs", cfg.Bus.PeerBusAddrs))
+		if cfg.Cluster.Mode == config.ModeCluster {
+			// Cluster mode: use ClusterClient for the local bus and each peer bus.
+			// This ensures XADD/XREADGROUP are routed to the correct shard automatically.
+			localBus := bus.NewRedisStreamsBusCluster(cfg.Cluster.Masters, cfg.Bus.Password, cfg.Bus.StreamPrefix, logger)
+			peerBuses := make(map[string]*bus.RedisStreamsBus, len(cfg.Bus.PeerBusAddrs))
+			for siteID, addr := range cfg.Bus.PeerBusAddrs {
+				// addr is a bootstrap node; ClusterClient discovers remaining nodes.
+				peerBuses[siteID] = bus.NewRedisStreamsBusCluster([]string{addr}, cfg.Bus.Password, cfg.Bus.StreamPrefix, logger)
+			}
+			return bus.NewPerPeerBusDirect(localBus, peerBuses, logger), nil
+		}
+		// Standalone embedded: use the master at master_index as the local bus.
+		localAddr := resolvedBusAddr(cfg)
 		return bus.NewPerPeerBus(
 			localAddr,
 			cfg.Bus.PeerBusAddrs,
@@ -279,17 +308,9 @@ func buildBusClient(cfg *config.Config, logger *zap.Logger) (bus.Bus, error) {
 	}
 }
 
-// pingBus pings the underlying Redis client for health check.
-// For PerPeerBus it pings the local bus; for RedisStreamsBus it pings directly.
+// pingBus checks connectivity by delegating to the Bus.Ping method.
 func pingBus(ctx context.Context, b bus.Bus) error {
-	switch v := b.(type) {
-	case *bus.RedisStreamsBus:
-		return v.Client().Ping(ctx).Err()
-	case *bus.PerPeerBus:
-		return v.RawLocalBus().Client().Ping(ctx).Err()
-	default:
-		return nil
-	}
+	return b.Ping(ctx)
 }
 
 // resolvedBusAddr returns the effective Redis address for the bus.

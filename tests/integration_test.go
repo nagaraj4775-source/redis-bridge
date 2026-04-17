@@ -60,7 +60,7 @@ func TestIntegrationWriteReplicates(t *testing.T) {
 	clockA := hlc.New()
 	ddA, _ := dedup.NewFilter(clientA, 5000, 100000)
 	mastersA := []*redis.Client{clientA}
-	prodA := producer.New("cluster-a", mastersA, replBus, clockA, ddA, logger)
+	prodA := producer.New("cluster-a", mastersA, clientA, replBus, clockA, ddA, logger)
 
 	// Setup agent B (consumer)
 	clockB := hlc.New()
@@ -125,14 +125,14 @@ func TestIntegrationLWWConvergence(t *testing.T) {
 	// Setup agents for both clusters
 	clockA := hlc.New()
 	ddA, _ := dedup.NewFilter(clientA, 5000, 100000)
-	prodA := producer.New("cluster-a", []*redis.Client{clientA}, replBus, clockA, ddA, logger)
+	prodA := producer.New("cluster-a", []*redis.Client{clientA}, clientA, replBus, clockA, ddA, logger)
 	appA := applier.New(clientA, ddA, logger)
 	consA := consumer.New("cluster-a", []string{"cluster-b"}, replBus, clientA, appA, ddA, clockA,
 		"repl-consumers", 100, 8, logger)
 
 	clockB := hlc.New()
 	ddB, _ := dedup.NewFilter(clientB, 5000, 100000)
-	prodB := producer.New("cluster-b", []*redis.Client{clientB}, replBus, clockB, ddB, logger)
+	prodB := producer.New("cluster-b", []*redis.Client{clientB}, clientB, replBus, clockB, ddB, logger)
 	appB := applier.New(clientB, ddB, logger)
 	consB := consumer.New("cluster-b", []string{"cluster-a"}, replBus, clientB, appB, ddB, clockB,
 		"repl-consumers", 100, 8, logger)
@@ -184,7 +184,7 @@ func TestIntegrationHashReplication(t *testing.T) {
 
 	clockA := hlc.New()
 	ddA, _ := dedup.NewFilter(clientA, 5000, 100000)
-	prodA := producer.New("cluster-a", []*redis.Client{clientA}, replBus, clockA, ddA, logger)
+	prodA := producer.New("cluster-a", []*redis.Client{clientA}, clientA, replBus, clockA, ddA, logger)
 
 	clockB := hlc.New()
 	ddB, _ := dedup.NewFilter(clientB, 5000, 100000)

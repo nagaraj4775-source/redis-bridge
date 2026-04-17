@@ -88,7 +88,7 @@ func e2eSkipIfNotRunning(t *testing.T) {
 
 // waitForValue polls client until key == want or timeout elapses.
 // Returns the measured latency if successful, error otherwise.
-func waitForValue(ctx context.Context, client *redis.Client, key, want string, timeout time.Duration) (time.Duration, error) {
+func waitForValue(ctx context.Context, client redis.UniversalClient, key, want string, timeout time.Duration) (time.Duration, error) {
 	start := time.Now()
 	deadline := start.Add(timeout)
 	for time.Now().Before(deadline) {
@@ -103,7 +103,7 @@ func waitForValue(ctx context.Context, client *redis.Client, key, want string, t
 }
 
 // waitForHash polls until a hash field matches want.
-func waitForHash(ctx context.Context, client *redis.Client, key, field, want string, timeout time.Duration) error {
+func waitForHash(ctx context.Context, client redis.UniversalClient, key, field, want string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		val, err := client.HGet(ctx, key, field).Result()
@@ -116,7 +116,7 @@ func waitForHash(ctx context.Context, client *redis.Client, key, field, want str
 }
 
 // waitForDeleted polls until the key no longer exists.
-func waitForDeleted(ctx context.Context, client *redis.Client, key string, timeout time.Duration) error {
+func waitForDeleted(ctx context.Context, client redis.UniversalClient, key string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		exists, _ := client.Exists(ctx, key).Result()

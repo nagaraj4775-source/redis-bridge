@@ -21,13 +21,13 @@ const (
 // Layer 1: Redis-backed shadow keys (__repl:applying:{key})
 // Layer 2: In-memory LRU cache keyed on SeqID
 type Filter struct {
-	client   *redis.Client
+	client   redis.UniversalClient
 	seqCache *lru.Cache[string, struct{}]
 	ttlMs    int
 }
 
 // NewFilter creates a new dedup filter.
-func NewFilter(client *redis.Client, ttlMs int, cacheSize int) (*Filter, error) {
+func NewFilter(client redis.UniversalClient, ttlMs int, cacheSize int) (*Filter, error) {
 	cache, err := lru.New[string, struct{}](cacheSize)
 	if err != nil {
 		return nil, fmt.Errorf("create LRU cache: %w", err)
