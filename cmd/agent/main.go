@@ -41,8 +41,21 @@ func main() {
 	if err != nil {
 		logger.Fatal("failed to load config", zap.Error(err))
 	}
+	// Resolve consumer ID: use config value → hostname → random UUID fallback.
+	// Must be unique per agent instance so XREADGROUP tracks each PEL separately.
+	consumerID := cfg.ConsumerID
+	if consumerID == "" {
+		if h, err := os.Hostname(); err == nil {
+			consumerID = h
+		} else {
+			consumerID = fmt.Sprintf("%s-%d", cfg.SiteID, time.Now().UnixNano())
+		}
+	}
+
 	logger.Info("config loaded",
 		zap.String("site_id", cfg.SiteID),
+		zap.String("role", cfg.Role),
+		zap.String("consumer_id", consumerID),
 		zap.Strings("masters", cfg.Cluster.Masters),
 		zap.Strings("peers", cfg.Peers))
 
@@ -113,6 +126,7 @@ func main() {
 	// Create consumer
 	cons := consumer.New(
 		cfg.SiteID,
+		consumerID,
 		cfg.Peers,
 		replBus,
 		localClient,
@@ -164,23 +178,31 @@ func main() {
 		}
 	}()
 
-	// Start producer
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := prod.Run(ctx); err != nil {
-			logger.Error("producer error", zap.Error(err))
-		}
-	}()
+	// Start producer (skipped in consumer-only role)
+	if cfg.Role != "consumer" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := prod.Run(ctx); err != nil {
+				logger.Error("producer error", zap.Error(err))
+			}
+		}()
+	} else {
+		logger.Info("role=consumer: producer disabled")
+	}
 
-	// Start consumer
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := cons.Run(ctx); err != nil {
-			logger.Error("consumer error", zap.Error(err))
-		}
-	}()
+	// Start consumer (skipped in producer-only role)
+	if cfg.Role != "producer" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := cons.Run(ctx); err != nil {
+				logger.Error("consumer error", zap.Error(err))
+			}
+		}()
+	} else {
+		logger.Info("role=producer: consumer disabled")
+	}
 
 	logger.Info("redibridge started",
 		zap.String("site_id", cfg.SiteID),

@@ -10,6 +10,8 @@ import (
 // Config is the top-level configuration for the replication agent.
 type Config struct {
 	SiteID      string            `mapstructure:"site_id"`
+	Role        string            `mapstructure:"role"`        // "full" (default) | "consumer" | "producer"
+	ConsumerID  string            `mapstructure:"consumer_id"` // unique name for XREADGROUP; defaults to hostname
 	Cluster     ClusterConfig     `mapstructure:"cluster"`
 	Bus         BusConfig         `mapstructure:"bus"`
 	Peers       []string          `mapstructure:"peers"`
@@ -92,6 +94,8 @@ func Load(path string) (*Config, error) {
 	v.SetConfigType("yaml")
 
 	// Defaults
+	v.SetDefault("role", "full")
+	v.SetDefault("consumer_id", "")
 	v.SetDefault("bus.stream_prefix", "repl:stream:")
 	v.SetDefault("bus.consumer_group", "repl-consumers")
 	v.SetDefault("bus.stream_max_len", int64(1_000_000))

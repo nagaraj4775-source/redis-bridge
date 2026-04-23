@@ -1,5 +1,7 @@
 # ─ Site identity ────────────────────────────────────────────────────────────
 site_id: "site-b"           # Unique name for this site — used in stream names and LWW resolution
+role: "full"          # "full" (producer+consumer) | "consumer" (scale-out apply) | "producer" (publish only)
+consumer_id: ""       # unique XREADGROUP consumer name; leave empty to use hostname automatically
 
 # ─ Local Redis connection (Sentinel HA) ──────────────────────────────────────────
 cluster:

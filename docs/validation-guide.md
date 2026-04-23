@@ -318,6 +318,143 @@ curl $AGENT_A/lag
 
 ---
 
+## Step 13 — Validate a Consumer-Only Agent
+
+Use this when you have deployed a second agent with `role: consumer` to scale out apply throughput.
+
+### 13a — Confirm the Consumer-Only Agent Started Correctly
+
+```bash
+# Check its startup logs — should say "role=consumer: producer disabled"
+sudo docker logs agent-a-consumer-2 --tail 20 | grep -E "role|consumer_id|producer disabled"
+```
+
+**Expected log lines:**
+```
+{"level":"info","msg":"config loaded","role":"consumer","consumer_id":"agent-a-consumer-2-hostname",...}
+{"level":"info","msg":"role=consumer: producer disabled"}
+{"level":"info","msg":"redibridge started","site_id":"ec-site-a",...}
+```
+
+If you see `producer disabled` — the agent is running in consumer-only mode correctly.
+
+### 13b — Confirm Both Consumer Names Are Registered in Redis
+
+```bash
+# List all consumers in the group that reads site-b's stream from site-a's perspective
+# Group name format: <consumer_group>-<site_id>  e.g. repl-consumers-ec-site-a
+sudo docker exec embedded-bus-redis-b-master1-1 \
+  redis-cli -c -h redis-b-master1 XINFO CONSUMERS repl:stream:ec-site-b repl-consumers-ec-site-a
+```
+
+**Expected output — two distinct consumers:**
+```
+1)  1) "name"
+    2) "agent-a-hostname-1"         ← main agent (role: full), consumer ID = its hostname
+    3) "pending"
+    4) (integer) 0                  ← no backlog when healthy
+    5) "idle"
+    6) (integer) 312                ← ms since it last fetched a message
+
+2)  1) "name"
+    2) "agent-a-consumer-2-host"    ← consumer-only agent, consumer ID = its hostname
+    3) "pending"
+    4) (integer) 0
+    5) "idle"
+    6) (integer) 289
+```
+
+> **Both names must be different.** If you see the same name twice, the consumer IDs collide — set `consumer_id` explicitly in one of the configs.
+
+### 13c — Verify Work Is Being Partitioned (Under Load)
+
+Write 1,000 keys rapidly on site-b and immediately inspect the PEL split:
+
+```bash
+# Generate 1,000 keys quickly on site-b
+(
+  for i in $(seq 1 1000); do
+    echo "SET validate:consumer-split:$i val$i"
+  done
+) | sudo docker exec -i embedded-bus-redis-b-master1-1 \
+    redis-cli -c -h redis-b-master1 --pipe
+
+# Immediately check PEL distribution — catch it before ACKs complete
+sleep 0.5
+sudo docker exec embedded-bus-redis-b-master1-1 \
+  redis-cli -c -h redis-b-master1 XINFO CONSUMERS repl:stream:ec-site-b repl-consumers-ec-site-a
+```
+
+**Expected:** Both consumers show non-zero `pending` counts that add up to approximately 1,000. The split is roughly equal but not guaranteed to be exactly 50/50 — Redis assigns entries to whichever consumer calls XREADGROUP first.
+
+### 13d — Confirm No Duplicate Keys Applied
+
+Each stream entry must be applied by **exactly one** consumer. Verify no key was written twice by checking its value is consistent:
+
+```bash
+# Wait for both consumers to finish
+sleep 5
+
+# Spot-check 5 keys on site-a — all should be present and correct
+for i in 100 250 500 750 999; do
+  echo -n "validate:consumer-split:$i = "
+  sudo docker exec embedded-bus-redis-a-master1-1 \
+    redis-cli -c -h redis-a-master1 GET validate:consumer-split:$i
+done
+```
+
+**Expected:** `val100`, `val250`, `val500`, `val750`, `val999` — all correct, none missing.
+
+### 13e — Confirm Only One Producer Is Running (Critical)
+
+Running two producers on the same site creates duplicate stream entries. Verify only one producer is active:
+
+```bash
+# Count active PSubscribe pattern subscriptions on site-a's masters
+# Should be exactly 1 per master regardless of how many consumer agents are running
+sudo docker exec embedded-bus-redis-a-master1-1 \
+  redis-cli -c -h redis-a-master1 PUBSUB NUMPAT
+
+sudo docker exec embedded-bus-redis-a-master2-1 \
+  redis-cli -c -h redis-a-master2 PUBSUB NUMPAT
+
+sudo docker exec embedded-bus-redis-a-master3-1 \
+  redis-cli -c -h redis-a-master3 PUBSUB NUMPAT
+```
+
+**Expected:** `1` on each master.  
+**If you see `2`:** a consumer-only agent was misconfigured with `role: full` — it is running a second producer. Fix its config to `role: consumer` and restart.
+
+---
+
+## Step 14 — Remove a Consumer Agent Gracefully
+
+When scaling down, Redis retains the consumer's PEL until it is cleaned up. Remove it explicitly to avoid orphaned pending entries:
+
+```bash
+# First, stop the consumer agent
+sudo docker stop agent-a-consumer-2
+
+# Wait for its PEL to drain to 0 naturally (messages it already fetched get re-delivered
+# to the remaining consumer after the XAUTOCLAIM timeout)
+# OR claim its pending messages immediately to the main consumer:
+
+sudo docker exec embedded-bus-redis-b-master1-1 \
+  redis-cli -c -h redis-b-master1 \
+  XAUTOCLAIM repl:stream:ec-site-b repl-consumers-ec-site-a agent-a-hostname-1 0 0-0 COUNT 10000
+
+# Once PEL = 0, delete the consumer entry from the group
+sudo docker exec embedded-bus-redis-b-master1-1 \
+  redis-cli -c -h redis-b-master1 \
+  XGROUP DELCONSUMER repl:stream:ec-site-b repl-consumers-ec-site-a agent-a-consumer-2-host
+
+# Confirm it's gone
+sudo docker exec embedded-bus-redis-b-master1-1 \
+  redis-cli -c -h redis-b-master1 XINFO CONSUMERS repl:stream:ec-site-b repl-consumers-ec-site-a
+```
+
+---
+
 ## Quick Health Checklist
 
 Run through this checklist before going live:
@@ -331,6 +468,13 @@ Run through this checklist before going live:
 [ ] __meta:{key} hash exists on the originating site after a write
 [ ] LWW test: all 3 sites converge to the same value after concurrent writes
 [ ] Catch-up test: restarted agent replays all missed entries and reaches lag=0
+
+# If running consumer-only scale-out agents:
+[ ] Consumer-only agent logs show "role=consumer: producer disabled"
+[ ] XINFO CONSUMERS shows 2+ unique consumer names (no duplicates)
+[ ] PUBSUB NUMPAT = 1 per master (only one producer active)
+[ ] PEL split visible under load (both consumers show non-zero pending)
+[ ] All keys present and correct on the target site after split apply
 ```
 
 ---
@@ -345,3 +489,7 @@ Run through this checklist before going live:
 | Stream grows forever | `stream_max_len` and `stream_ttl_hours` both 0 | Set `stream_ttl_hours` in agent config (e.g. `72` for 3 days) |
 | Agent crashes on startup | Bad config or Redis not reachable | Check `agent.yaml` and Redis connectivity |
 | Replication loop | Shadow key TTL too long | Default is `dedup_ttl_seconds: 5`; reduce if needed |
+| PUBSUB NUMPAT = 2 on a master | Two producers running on same site | Set `role: consumer` on the extra agent; restart it |
+| Two consumers have same name | `consumer_id` collision | Set explicit `consumer_id` in each agent's config |
+| Orphaned PEL after consumer removed | Consumer stopped without cleanup | Run `XAUTOCLAIM` + `XGROUP DELCONSUMER` (Step 14) |
+| Second consumer not appearing in XINFO | Consumer agent not yet connected | Check agent-2 logs; verify it uses the same `bus` config |

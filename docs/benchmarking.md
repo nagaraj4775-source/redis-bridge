@@ -217,6 +217,163 @@ sudo docker exec embedded-bus-redis-b-master1-1 \
 
 ---
 
+## Benchmark 6 — Scale-out Consumer: 100k Keys Lag Drain
+
+Demonstrates and measures how a second consumer-only agent accelerates lag recovery after a large backlog.
+
+This test has **three phases**:
+1. Build a 100k-entry backlog (stop agent, insert 100k keys, restart, measure solo drain speed)
+2. Add a second consumer agent mid-drain, observe the acceleration
+3. Compare drain time: single consumer vs dual consumer
+
+### Phase 1 — Build the 100k Backlog
+
+```bash
+# Stop site-a's agent to let lag accumulate
+sudo docker stop embedded-bus-agent-a-1
+echo "Agent-a stopped. Inserting 100k keys on site-b..."
+
+TIMESTAMP=$(date +%s%N)
+
+# Insert 100,000 keys in batches of 500 (same rate as demo script)
+for batch_start in $(seq 1 500 100000); do
+  batch_end=$((batch_start + 499))
+  (
+    for i in $(seq $batch_start $batch_end); do
+      echo "SET {bench}:scaleout:${TIMESTAMP}:$i val$i"
+    done
+  ) | sudo docker exec -i embedded-bus-redis-b-master1-1 \
+      redis-cli -c -h redis-b-master1 --pipe > /dev/null
+  sleep 0.05
+done
+
+echo "100k keys inserted. Checking stream lag..."
+
+# Verify lag on site-b's stream before restarting site-a
+sudo docker exec embedded-bus-redis-b-master1-1 \
+  redis-cli -c -h redis-b-master1 XINFO GROUPS repl:stream:ec-site-b
+```
+
+**Expected output (before restart):** `lag` ≈ 100000, `pending` = 0
+
+### Phase 2 — Restart Single Consumer and Measure Baseline
+
+```bash
+# Restart site-a's agent (single consumer)
+START_SINGLE=$(date +%s%3N)
+sudo docker start embedded-bus-agent-a-1
+echo "Agent-a started (single consumer). Monitoring lag every 5 seconds..."
+
+# Poll lag every 5 seconds and log it
+for i in $(seq 1 12); do
+  sleep 5
+  LAG=$(curl -s http://localhost:8291/lag | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('ec-site-b',{}).get('lag',0))" 2>/dev/null || echo "N/A")
+  ELAPSED=$(( ($(date +%s%3N) - START_SINGLE) / 1000 ))
+  echo "  [${ELAPSED}s] lag=ec-site-b: $LAG"
+  if [ "$LAG" = "0" ]; then
+    echo "✓ Single consumer drained lag in ${ELAPSED}s"
+    break
+  fi
+done
+```
+
+Record the drain time — this is your **baseline** (single consumer).
+
+### Phase 3 — Repeat with Dual Consumer and Compare
+
+```bash
+# Stop agent-a again and re-insert 100k keys to rebuild the backlog
+sudo docker stop embedded-bus-agent-a-1
+
+TIMESTAMP2=$(date +%s%N)
+for batch_start in $(seq 1 500 100000); do
+  batch_end=$((batch_start + 499))
+  (
+    for i in $(seq $batch_start $batch_end); do
+      echo "SET {bench}:scaleout2:${TIMESTAMP2}:$i val$i"
+    done
+  ) | sudo docker exec -i embedded-bus-redis-b-master1-1 \
+      redis-cli -c -h redis-b-master1 --pipe > /dev/null
+  sleep 0.05
+done
+echo "100k keys inserted again. Starting DUAL consumers..."
+
+# Start two consumer agents simultaneously
+START_DUAL=$(date +%s%3N)
+sudo docker start embedded-bus-agent-a-1
+
+# Start a second consumer-only agent (uses hostname = unique consumer-id automatically)
+sudo docker run -d --name agent-a-consumer-2 \
+  --network embedded-bus_default \
+  -e REDIBRIDGE_ROLE=consumer \
+  -v $(pwd)/config/cluster/embedded-bus/agent-a.yaml:/etc/redibridge/agent.yaml \
+  redibridge:latest \
+  redibridge --config /etc/redibridge/agent.yaml
+
+echo "Two consumers running. Monitoring lag..."
+
+# Poll lag every 5 seconds
+for i in $(seq 1 12); do
+  sleep 5
+  LAG=$(curl -s http://localhost:8291/lag | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('ec-site-b',{}).get('lag',0))" 2>/dev/null || echo "N/A")
+  ELAPSED=$(( ($(date +%s%3N) - START_DUAL) / 1000 ))
+  echo "  [${ELAPSED}s] lag=ec-site-b: $LAG"
+  if [ "$LAG" = "0" ]; then
+    echo "✓ Dual consumer drained lag in ${ELAPSED}s"
+    break
+  fi
+done
+
+# Verify both consumers processed messages
+echo ""
+echo "Consumer group members on site-b's stream:"
+sudo docker exec embedded-bus-redis-b-master1-1 \
+  redis-cli -c -h redis-b-master1 XINFO CONSUMERS repl:stream:ec-site-b repl-consumers-ec-site-a
+
+# Clean up
+sudo docker stop agent-a-consumer-2
+sudo docker rm agent-a-consumer-2
+```
+
+### Verifying Consumer Names During the Test
+
+While both consumers are running, check their PEL and message counts:
+
+```bash
+sudo docker exec embedded-bus-redis-b-master1-1 \
+  redis-cli -c -h redis-b-master1 XINFO CONSUMERS repl:stream:ec-site-b repl-consumers-ec-site-a
+```
+
+**Expected output — two consumers visible with split pending entries:**
+```
+1)  1) "name"
+    2) "agent-a-hostname-1"       ← consumer 1 (from main agent's hostname)
+    3) "pending"
+    4) 47832                      ← messages assigned to consumer 1
+    5) "idle"
+    6) 123                        ← ms since last active
+
+2)  1) "name"
+    2) "agent-a-hostname-2"       ← consumer 2 (second container's hostname)
+    3) "pending"
+    4) 52168                      ← messages assigned to consumer 2
+    5) "idle"
+    6) 89
+```
+
+Total pending across both = 100,000. Split roughly 50/50.
+
+### Expected Results
+
+| Setup | 100k key drain time | Keys/s |
+|-------|---------------------|--------|
+| Single consumer (`apply_concurrency=8`) | ~30–40s | ~2,500–3,300 |
+| Dual consumer (`apply_concurrency=8` each) | ~15–20s | ~5,000–6,600 |
+
+> **Note:** Drain time scales approximately linearly with number of consumers. The bottleneck shifts to Redis write speed after ~4 consumer agents.
+
+---
+
 ## Test Case Validation — End-to-End Demo Script
 
 The script at `scripts/demo_cluster_embedded.sh` runs all test cases automatically.
@@ -352,4 +509,7 @@ replication:
 [ ] Lag returns to 0 within 60s after 100k bulk insert
 [ ] Failover: replica promoted within 30s, replication resumes
 [ ] Full demo script exits with code 0 (all 11 steps pass)
+[ ] Scale-out consumer: dual consumer drains 100k in < 20s
+[ ] XINFO CONSUMERS shows 2 unique consumer names, PEL split ~50/50
+[ ] Drain time with 2 consumers is ≈ 50% of single-consumer baseline
 ```

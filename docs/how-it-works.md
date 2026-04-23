@@ -41,6 +41,92 @@ Each site has:
 
 ---
 
+## Agent Roles — Scaling Consumer Apply Throughput
+
+By default every agent runs **both** producer and consumer (`role: full`). You can split them when you need to scale out the apply side independently.
+
+### The Three Roles
+
+| Role | What runs | When to use |
+|------|-----------|-------------|
+| `full` | Producer + Consumer | Default — one agent does everything |
+| `consumer` | Consumer only | Add extra apply workers to drain lag faster |
+| `producer` | Producer only | Dedicated watcher with no apply overhead (advanced) |
+
+### How It Works With Multiple Consumers
+
+Redis consumer groups natively partition work across consumers. When you add a second consumer agent:
+
+```
+repl:stream:ec-site-b  (100,000 pending entries)
+  ┌──────────────────────────────────────────────────────┐
+  │  XREADGROUP call by agent-a-1  → gets entries 1,3,5… │
+  │  XREADGROUP call by agent-a-2  → gets entries 2,4,6… │
+  └──────────────────────────────────────────────────────┘
+  Each entry goes to exactly ONE consumer. 2× consumers = 2× apply speed.
+```
+
+Each consumer **must have a unique consumer ID** so Redis tracks their pending entry list (PEL) separately.
+
+### Consumer ID — How It Is Assigned
+
+RedisBridge resolves the consumer ID in this priority order:
+
+```
+1. consumer_id field in agent.yaml         (explicit, always wins)
+2. OS hostname                              (auto — works in Docker/Kubernetes)
+3. siteID + unix-nanoseconds               (last-resort fallback)
+```
+
+In Docker/Kubernetes, every container already has a unique hostname — so leaving `consumer_id: ""` is enough.
+
+### Deploying a Scale-out Consumer Agent
+
+Keep your main agent as `role: full` (it runs the producer). Add extra agents as `role: consumer`:
+
+```yaml
+# agent-a-consumer-2.yaml  ← copy of agent-a.yaml with these two lines changed
+site_id: "ec-site-a"
+role: "consumer"            # ← no producer started on this instance
+consumer_id: ""             # ← hostname used automatically (must be unique)
+
+# All other config (cluster, bus, peers, replication) stays identical
+```
+
+Start it alongside the main agent:
+
+```bash
+# With Docker Compose (add a second service in docker-compose.yml)
+redibridge --config /etc/redibridge/agent-a-consumer-2.yaml
+
+# Or in Docker directly
+sudo docker run --name agent-a-consumer-2 \
+  -v $(pwd)/config/cluster/embedded-bus/agent-a-consumer-2.yaml:/etc/redibridge/agent.yaml \
+  redibridge:latest
+```
+
+### Visual Architecture (1 Full + 2 Consumer Agents)
+
+```
+Site-A Redis ──keyspace events──► Agent-A (role: full)
+                                   │  Producer: publishes to Stream-A
+                                   │  Consumer: reads Stream-B + Stream-C
+                                   │
+                              ╔════╧═══════════════════════════════╗
+                              ║   repl:stream:ec-site-b            ║
+                              ║   100,000 pending entries          ║
+                              ╚════╤════════╤═══════════════════════╝
+                                   │        │
+                      ┌────────────┘        └────────────┐
+                      ▼                                  ▼
+              Agent-A-1 (full)                  Agent-A-2 (consumer)
+              consumer-id: host-1               consumer-id: host-2
+              applies entries 1,3,5…            applies entries 2,4,6…
+              → Site-A Redis                    → Site-A Redis
+```
+
+---
+
 ## Step-by-Step Replication Flow
 
 ```

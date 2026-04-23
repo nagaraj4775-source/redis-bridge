@@ -17,6 +17,7 @@ import (
 // Consumer reads delta events from remote peers and applies them locally.
 type Consumer struct {
 	siteID       string
+	consumerID   string // unique XREADGROUP consumer name — set per agent instance
 	peers        []string
 	bus          bus.Bus
 	localClient  redis.UniversalClient
@@ -38,8 +39,13 @@ type Consumer struct {
 }
 
 // New creates a new Consumer.
+// consumerID must be unique per agent instance on the same site so that
+// XREADGROUP tracks each instance's PEL (pending entry list) independently.
+// Use hostname or a numbered suffix (e.g. "ec-site-a-consumer-2") when
+// running multiple consumer-only agents on the same site.
 func New(
 	siteID string,
+	consumerID string,
 	peers []string,
 	b bus.Bus,
 	localClient redis.UniversalClient,
@@ -53,6 +59,7 @@ func New(
 ) *Consumer {
 	return &Consumer{
 		siteID:      siteID,
+		consumerID:  consumerID,
 		peers:       peers,
 		bus:         b,
 		localClient: localClient,
@@ -139,7 +146,7 @@ func (c *Consumer) IsPaused(peer string) bool {
 
 func (c *Consumer) consumePeer(ctx context.Context, peerID string) {
 	logger := c.logger.With(zap.String("peer", peerID))
-	consumerName := c.siteID + "-consumer"
+	consumerName := c.consumerID
 
 	// Start by draining the PEL (messages delivered but not ACKed in a prior
 	// run). Once the PEL is empty, switch to ">" for new messages.
