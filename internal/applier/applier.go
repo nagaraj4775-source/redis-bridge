@@ -49,30 +49,37 @@ func (a *Applier) Apply(ctx context.Context, delta bus.Delta) error {
 		}
 	}
 
-	// Set dedup shadow key
-	if err := a.dedup.MarkApplying(ctx, delta.Key); err != nil {
+	// Set dedup shadow key with value hash so the producer can distinguish
+	// Apply events (value matches hash) from original writes (value differs).
+	if err := a.dedup.MarkApplying(ctx, delta.Key, delta.Value); err != nil {
 		return fmt.Errorf("mark applying: %w", err)
 	}
 
-	pipe := a.client.Pipeline()
-
-	// Apply value based on key type
+	// Phase 1: apply value using direct client calls (not pipeline).
+	// ClusterClient.Pipeline().Exec() can silently swallow errors in cluster
+	// mode, so we use direct calls that surface errors immediately.
 	switch delta.KeyType {
 	case "string":
-		pipe.Set(ctx, delta.Key, delta.Value, 0)
+		if err := a.client.Set(ctx, delta.Key, delta.Value, 0).Err(); err != nil {
+			return fmt.Errorf("SET %s: %w", delta.Key, err)
+		}
 
 	case "hash":
 		var fields map[string]string
 		if err := json.Unmarshal(delta.Value, &fields); err != nil {
 			return fmt.Errorf("unmarshal hash: %w", err)
 		}
-		pipe.Del(ctx, delta.Key)
+		if err := a.client.Del(ctx, delta.Key).Err(); err != nil {
+			return fmt.Errorf("DEL %s: %w", delta.Key, err)
+		}
 		if len(fields) > 0 {
 			flat := make([]interface{}, 0, len(fields)*2)
 			for k, v := range fields {
 				flat = append(flat, k, v)
 			}
-			pipe.HSet(ctx, delta.Key, flat...)
+			if err := a.client.HSet(ctx, delta.Key, flat...).Err(); err != nil {
+				return fmt.Errorf("HSET %s: %w", delta.Key, err)
+			}
 		}
 
 	case "list":
@@ -80,13 +87,17 @@ func (a *Applier) Apply(ctx context.Context, delta bus.Delta) error {
 		if err := json.Unmarshal(delta.Value, &elements); err != nil {
 			return fmt.Errorf("unmarshal list: %w", err)
 		}
-		pipe.Del(ctx, delta.Key)
+		if err := a.client.Del(ctx, delta.Key).Err(); err != nil {
+			return fmt.Errorf("DEL %s: %w", delta.Key, err)
+		}
 		if len(elements) > 0 {
 			ifaces := make([]interface{}, len(elements))
 			for i, e := range elements {
 				ifaces[i] = e
 			}
-			pipe.RPush(ctx, delta.Key, ifaces...)
+			if err := a.client.RPush(ctx, delta.Key, ifaces...).Err(); err != nil {
+				return fmt.Errorf("RPUSH %s: %w", delta.Key, err)
+			}
 		}
 
 	case "set":
@@ -94,13 +105,17 @@ func (a *Applier) Apply(ctx context.Context, delta bus.Delta) error {
 		if err := json.Unmarshal(delta.Value, &members); err != nil {
 			return fmt.Errorf("unmarshal set: %w", err)
 		}
-		pipe.Del(ctx, delta.Key)
+		if err := a.client.Del(ctx, delta.Key).Err(); err != nil {
+			return fmt.Errorf("DEL %s: %w", delta.Key, err)
+		}
 		if len(members) > 0 {
 			ifaces := make([]interface{}, len(members))
 			for i, m := range members {
 				ifaces[i] = m
 			}
-			pipe.SAdd(ctx, delta.Key, ifaces...)
+			if err := a.client.SAdd(ctx, delta.Key, ifaces...).Err(); err != nil {
+				return fmt.Errorf("SADD %s: %w", delta.Key, err)
+			}
 		}
 
 	case "zset":
@@ -108,18 +123,23 @@ func (a *Applier) Apply(ctx context.Context, delta bus.Delta) error {
 		if err := json.Unmarshal(delta.Value, &entries); err != nil {
 			return fmt.Errorf("unmarshal zset: %w", err)
 		}
-		pipe.Del(ctx, delta.Key)
+		if err := a.client.Del(ctx, delta.Key).Err(); err != nil {
+			return fmt.Errorf("DEL %s: %w", delta.Key, err)
+		}
 		if len(entries) > 0 {
 			zMembers := make([]redis.Z, len(entries))
 			for i, e := range entries {
 				zMembers[i] = redis.Z{Score: e.Score, Member: e.Member}
 			}
-			pipe.ZAdd(ctx, delta.Key, zMembers...)
+			if err := a.client.ZAdd(ctx, delta.Key, zMembers...).Err(); err != nil {
+				return fmt.Errorf("ZADD %s: %w", delta.Key, err)
+			}
 		}
 
 	case "none":
-		// Key was deleted at source
-		pipe.Del(ctx, delta.Key)
+		if err := a.client.Del(ctx, delta.Key).Err(); err != nil {
+			return fmt.Errorf("DEL %s: %w", delta.Key, err)
+		}
 
 	default:
 		return fmt.Errorf("unsupported key type: %s", delta.KeyType)
@@ -128,17 +148,18 @@ func (a *Applier) Apply(ctx context.Context, delta bus.Delta) error {
 	// Apply TTL if present and key type is not "none"
 	if delta.KeyType != "none" && delta.TTLMs > 0 {
 		expireAt := delta.CapturedAt + delta.TTLMs
-		pipe.PExpireAt(ctx, delta.Key, time.UnixMilli(expireAt))
+		if err := a.client.PExpireAt(ctx, delta.Key, time.UnixMilli(expireAt)).Err(); err != nil {
+			a.logger.Warn("PExpireAt failed", zap.String("key", delta.Key), zap.Error(err))
+		}
 	}
 
-	// Update __meta:{key} with HLC and site_id
+	// Phase 2: update __meta:{key} with HLC and site_id only after the value
+	// write committed. If this fails the consumer will not ACK the message;
+	// on retry ReadMeta returns the old (lower) HLC so the delta is accepted
+	// and both writes are re-attempted.
 	metaKey := metaPrefix + delta.Key
-	pipe.HSet(ctx, metaKey, "hlc", strconv.FormatUint(delta.HLC, 10), "site", delta.SiteID)
-
-	// Execute pipeline
-	_, err := pipe.Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("pipeline exec: %w", err)
+	if err := a.client.HSet(ctx, metaKey, "hlc", strconv.FormatUint(delta.HLC, 10), "site", delta.SiteID).Err(); err != nil {
+		return fmt.Errorf("meta write: %w", err)
 	}
 
 	return nil

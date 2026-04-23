@@ -3,6 +3,7 @@ package bus
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -28,13 +29,14 @@ type PerPeerBus struct {
 //   - peerAddrs  : map[siteID]redisAddr for peer streams
 //   - password   : shared password (or "" for none)
 //   - streamPrefix: e.g. "repl:stream:"
-func NewPerPeerBus(localAddr string, peerAddrs map[string]string, password, streamPrefix string, logger *zap.Logger) *PerPeerBus {
+//   - streamTTL  : time-based retention (0 = disabled, use maxLen instead)
+func NewPerPeerBus(localAddr string, peerAddrs map[string]string, password, streamPrefix string, maxLen int64, streamTTL time.Duration, logger *zap.Logger) *PerPeerBus {
 	peers := make(map[string]*RedisStreamsBus, len(peerAddrs))
 	for siteID, addr := range peerAddrs {
-		peers[siteID] = NewRedisStreamsBus(addr, password, streamPrefix, logger)
+		peers[siteID] = NewRedisStreamsBus(addr, password, streamPrefix, maxLen, streamTTL, logger)
 	}
 	return &PerPeerBus{
-		local:  NewRedisStreamsBus(localAddr, password, streamPrefix, logger),
+		local:  NewRedisStreamsBus(localAddr, password, streamPrefix, maxLen, streamTTL, logger),
 		peers:  peers,
 		logger: logger,
 	}
@@ -61,12 +63,12 @@ func (p *PerPeerBus) Publish(ctx context.Context, siteID string, delta Delta) er
 }
 
 // Consume reads from the named peer's Redis.
-func (p *PerPeerBus) Consume(ctx context.Context, peerSiteID string, group string, consumer string, batchSize int) ([]Message, error) {
+func (p *PerPeerBus) Consume(ctx context.Context, peerSiteID string, group string, consumer string, batchSize int, startID string) ([]Message, error) {
 	peer, ok := p.peers[peerSiteID]
 	if !ok {
 		return nil, fmt.Errorf("PerPeerBus: no bus configured for peer %q", peerSiteID)
 	}
-	return peer.Consume(ctx, peerSiteID, group, consumer, batchSize)
+	return peer.Consume(ctx, peerSiteID, group, consumer, batchSize, startID)
 }
 
 // Ack acknowledges messages on the peer's Redis.
@@ -90,6 +92,15 @@ func (p *PerPeerBus) EnsureGroup(ctx context.Context, peerSiteID, group string) 
 // StreamLen returns the length of this site's local stream.
 func (p *PerPeerBus) StreamLen(ctx context.Context, siteID string) (int64, error) {
 	return p.local.StreamLen(ctx, siteID)
+}
+
+// GroupLag returns consumer-group lag stats from the named peer's Redis.
+func (p *PerPeerBus) GroupLag(ctx context.Context, peerSiteID, group string) (LagInfo, error) {
+	peer, ok := p.peers[peerSiteID]
+	if !ok {
+		return LagInfo{}, fmt.Errorf("PerPeerBus: no bus configured for peer %q", peerSiteID)
+	}
+	return peer.GroupLag(ctx, peerSiteID, group)
 }
 
 // Close shuts down all bus clients.

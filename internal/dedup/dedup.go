@@ -3,6 +3,8 @@ package dedup
 import (
 	"context"
 	"fmt"
+	"hash/crc32"
+	"strconv"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -11,19 +13,16 @@ import (
 
 const (
 	shadowPrefix = "__repl:applying:"
-	// shadowTTL is the lifetime of the loop-prevention shadow key.
-	// It only needs to outlive the keyspace notification round-trip
-	// (~1ms locally). 200ms is generous while not blocking user writes.
-	shadowTTL = 200 * time.Millisecond
 )
 
 // Filter provides two-layer loop prevention:
 // Layer 1: Redis-backed shadow keys (__repl:applying:{key})
 // Layer 2: In-memory LRU cache keyed on SeqID
 type Filter struct {
-	client   redis.UniversalClient
-	seqCache *lru.Cache[string, struct{}]
-	ttlMs    int
+	client    redis.UniversalClient
+	seqCache  *lru.Cache[string, struct{}]
+	ttlMs     int
+	shadowTTL time.Duration
 }
 
 // NewFilter creates a new dedup filter.
@@ -32,10 +31,18 @@ func NewFilter(client redis.UniversalClient, ttlMs int, cacheSize int) (*Filter,
 	if err != nil {
 		return nil, fmt.Errorf("create LRU cache: %w", err)
 	}
+	// shadowTTL must be long enough to cover the keyspace-event round-trip AND
+	// the concurrent producer semaphore wait, but short enough that original
+	// write events (which can be delayed by docker-exec or network latency)
+	// find the shadow expired so they get published. 200ms is the sweet spot:
+	// covers the Apply event dispatch (~15ms worst case) while expiring before
+	// delayed external writes arrive (~200-500ms via docker exec).
+	shTTL := 200 * time.Millisecond
 	return &Filter{
-		client:   client,
-		seqCache: cache,
-		ttlMs:    ttlMs,
+		client:    client,
+		seqCache:  cache,
+		ttlMs:     ttlMs,
+		shadowTTL: shTTL,
 	}, nil
 }
 
@@ -49,11 +56,35 @@ func (f *Filter) IsApplying(ctx context.Context, key string) (bool, error) {
 	return val > 0, nil
 }
 
-// MarkApplying sets the shadow key to indicate a replication write is in progress.
-// Uses a fixed short TTL (shadowTTL) so legitimate user writes to the same key
-// are not blocked after the replication write settles.
-func (f *Filter) MarkApplying(ctx context.Context, key string) error {
-	return f.client.Set(ctx, shadowPrefix+key, "1", shadowTTL).Err()
+// MarkApplying stores a CRC32 hash of the applied value as the shadow key.
+// The producer reads the current key value, hashes it, and compares:
+//   - Match → the current value IS the applied value → Apply event → skip
+//   - Mismatch → a new write overwrote the applied value → publish
+func (f *Filter) MarkApplying(ctx context.Context, key string, value []byte) error {
+	hash := crc32.ChecksumIEEE(value)
+	return f.client.Set(ctx, shadowPrefix+key, strconv.FormatUint(uint64(hash), 10), f.shadowTTL).Err()
+}
+
+// ApplyingHash returns the CRC32 hash stored in the shadow key, or 0 if none.
+// The producer uses this to compare against the current key value's hash.
+func (f *Filter) ApplyingHash(ctx context.Context, key string) (uint32, error) {
+	val, err := f.client.Get(ctx, shadowPrefix+key).Result()
+	if err == redis.Nil {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("GET %s: %w", shadowPrefix+key, err)
+	}
+	n, err := strconv.ParseUint(val, 10, 32)
+	if err != nil {
+		return 0, nil // legacy or corrupt → treat as no shadow
+	}
+	return uint32(n), nil
+}
+
+// ValueHash returns CRC32 of a byte slice.
+func ValueHash(b []byte) uint32 {
+	return crc32.ChecksumIEEE(b)
 }
 
 // SeenSeqID checks if a SeqID has already been processed.

@@ -1,0 +1,42 @@
+# ─ Site identity ────────────────────────────────────────────────────────────
+site_id: "site-b"           # Unique name for this site — used in stream names and LWW resolution
+
+# ─ Local Redis connection ────────────────────────────────────────────────────
+cluster:
+  mode: "standalone"        # standalone | sentinel | cluster
+  addr: "redis-b:6379"      # Redis address for this site's data store
+  password: ""              # Redis AUTH password ("" = no auth)
+  tls: false                # Set true to enable TLS for the Redis connection
+
+# ─ Replication bus (embedded) ────────────────────────────────────────────────────
+bus:
+  mode: "embedded"          # embedded = no separate bus; stream lives on this site's own Redis
+  master_index: 0           # Which master hosts the stream (0 = first/only master for standalone)
+  peer_bus_addrs:           # Bootstrap address to reach each peer's replication stream
+    site-a: "redis-a:6379" # Agent reads site-a's stream from this address
+    site-c: "redis-c:6379" # Agent reads site-c's stream from this address
+  stream_prefix: "repl:stream:"      # Key prefix for all replication streams (stream = prefix + site_id)
+  consumer_group: "repl-consumers"   # Consumer group name (scoped per site internally)
+  stream_max_len: 1000000   # Max entries retained per stream; oldest trimmed on each write (0 = unlimited)
+  stream_ttl_hours: 0   # Time-based retention: trim entries older than N hours (0 = disabled; takes priority over stream_max_len when set)
+  password: ""              # Redis AUTH password for peer connections ("" = no auth)
+
+# ─ Peer sites to replicate from ─────────────────────────────────────────────
+peers:
+  - "site-a"                # Must match the site_id of the peer's agent config
+  - "site-c"
+
+# ─ Replication tuning ────────────────────────────────────────────────────────
+replication:
+  batch_size: 100           # Messages fetched per XREADGROUP call per peer
+  apply_concurrency: 8      # Parallel goroutines applying messages from a single peer stream
+  dedup_ttl_seconds: 5      # Shadow key TTL (seconds) used to suppress replication loops
+  max_in_flight: 1000       # Max unacknowledged messages before the consumer pauses (backpressure)
+
+# ─ HTTP coordinator API ──────────────────────────────────────────────────────
+coordinator:
+  port: 8080                # Serves: GET /lag  GET /pause  GET /resume  GET /status
+
+# ─ Prometheus metrics ────────────────────────────────────────────────────────
+metrics:
+  port: 9090                # Prometheus scrape endpoint at http://host:9090/metrics

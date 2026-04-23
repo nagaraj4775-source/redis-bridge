@@ -61,6 +61,8 @@ type BusConfig struct {
 	SentinelAddrs  []string           `mapstructure:"sentinel_addrs"`
 	StreamPrefix   string             `mapstructure:"stream_prefix"`
 	ConsumerGroup  string             `mapstructure:"consumer_group"`
+	StreamMaxLen   int64              `mapstructure:"stream_max_len"` // max entries retained per stream (0 = unlimited)
+	StreamTTLHours int                `mapstructure:"stream_ttl_hours"` // time-based retention: trim entries older than N hours (0 = disabled; takes priority over stream_max_len when set)
 	Password       string             `mapstructure:"password"`
 }
 
@@ -92,6 +94,8 @@ func Load(path string) (*Config, error) {
 	// Defaults
 	v.SetDefault("bus.stream_prefix", "repl:stream:")
 	v.SetDefault("bus.consumer_group", "repl-consumers")
+	v.SetDefault("bus.stream_max_len", int64(1_000_000))
+	v.SetDefault("bus.stream_ttl_hours", 0)
 	v.SetDefault("replication.batch_size", 100)
 	v.SetDefault("replication.apply_concurrency", 8)
 	v.SetDefault("replication.dedup_ttl_seconds", 5)

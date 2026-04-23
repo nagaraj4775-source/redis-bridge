@@ -1,0 +1,185 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────
+# Cluster › Embedded Bus
+# 3 Redis Clusters (3 masters each) — NO separate bus container.
+# master1 of each site hosts its replication stream.
+#
+# Port layout:
+#   redis-a master1/2/3   : 6411 / 6412 / 6413
+#   redis-a replica1/2/3  : 6421 / 6422 / 6423  (site-a has HA replicas)
+#   redis-b master1/2/3   : 6414 / 6415 / 6416
+#   redis-c master1/2/3   : 6417 / 6418 / 6419
+#   agent-a coordinator : 8291   metrics: 9291
+#   agent-b coordinator : 8292   metrics: 9292
+#   agent-c coordinator : 8293   metrics: 9293
+#
+# Usage:
+#   docker compose -f docker/cluster/embedded-bus/docker-compose.yml up --build -d
+# ─────────────────────────────────────────────────────────────
+
+services:
+  # ─── Site A Masters ───
+  redis-a-master1:
+    image: redis:7-alpine
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-a-master1 --cluster-preferred-endpoint-type hostname
+    ports: ["6411:6379"]
+    volumes: [redis-a-master1-data:/data]
+    networks: [replnet]
+
+  redis-a-master2:
+    image: redis:7-alpine
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-a-master2 --cluster-preferred-endpoint-type hostname
+    ports: ["6412:6379"]
+    volumes: [redis-a-master2-data:/data]
+    networks: [replnet]
+
+  redis-a-master3:
+    image: redis:7-alpine
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-a-master3 --cluster-preferred-endpoint-type hostname
+    ports: ["6413:6379"]
+    volumes: [redis-a-master3-data:/data]
+    networks: [replnet]
+
+  # ─── Site A Replicas (1 replica per master — enables Step 11 failover demo) ───
+  redis-a-replica1:
+    image: redis:7-alpine
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-a-replica1 --cluster-preferred-endpoint-type hostname
+    ports: ["6421:6379"]
+    volumes: [redis-a-replica1-data:/data]
+    networks: [replnet]
+
+  redis-a-replica2:
+    image: redis:7-alpine
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-a-replica2 --cluster-preferred-endpoint-type hostname
+    ports: ["6422:6379"]
+    volumes: [redis-a-replica2-data:/data]
+    networks: [replnet]
+
+  redis-a-replica3:
+    image: redis:7-alpine
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-a-replica3 --cluster-preferred-endpoint-type hostname
+    ports: ["6423:6379"]
+    volumes: [redis-a-replica3-data:/data]
+    networks: [replnet]
+
+  # ─── Site B Masters ───
+  redis-b-master1:
+    image: redis:7-alpine
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-b-master1 --cluster-preferred-endpoint-type hostname
+    ports: ["6414:6379"]
+    volumes: [redis-b-master1-data:/data]
+    networks: [replnet]
+
+  redis-b-master2:
+    image: redis:7-alpine
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-b-master2 --cluster-preferred-endpoint-type hostname
+    ports: ["6415:6379"]
+    volumes: [redis-b-master2-data:/data]
+    networks: [replnet]
+
+  redis-b-master3:
+    image: redis:7-alpine
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-b-master3 --cluster-preferred-endpoint-type hostname
+    ports: ["6416:6379"]
+    volumes: [redis-b-master3-data:/data]
+    networks: [replnet]
+
+  # ─── Site C Masters ───
+  redis-c-master1:
+    image: redis:7-alpine
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-c-master1 --cluster-preferred-endpoint-type hostname
+    ports: ["6417:6379"]
+    volumes: [redis-c-master1-data:/data]
+    networks: [replnet]
+
+  redis-c-master2:
+    image: redis:7-alpine
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-c-master2 --cluster-preferred-endpoint-type hostname
+    ports: ["6418:6379"]
+    volumes: [redis-c-master2-data:/data]
+    networks: [replnet]
+
+  redis-c-master3:
+    image: redis:7-alpine
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-c-master3 --cluster-preferred-endpoint-type hostname
+    ports: ["6419:6379"]
+    volumes: [redis-c-master3-data:/data]
+    networks: [replnet]
+
+  # ─── Cluster init — joins nodes into a 3-master cluster per site (skips if already formed) ───
+  cluster-init-a:
+    image: redis:7-alpine
+    depends_on: [redis-a-master1, redis-a-master2, redis-a-master3, redis-a-replica1, redis-a-replica2, redis-a-replica3]
+    restart: "no"
+    command: ["sh", "-c", "sleep 8 && (redis-cli -h redis-a-master1 cluster info | grep -q 'cluster_size:3') && echo 'cluster-a already up' || redis-cli --cluster create redis-a-master1:6379 redis-a-master2:6379 redis-a-master3:6379 redis-a-replica1:6379 redis-a-replica2:6379 redis-a-replica3:6379 --cluster-replicas 1 --cluster-yes"]
+    networks: [replnet]
+
+  cluster-init-b:
+    image: redis:7-alpine
+    depends_on: [redis-b-master1, redis-b-master2, redis-b-master3]
+    restart: "no"
+    command: ["sh", "-c", "sleep 8 && (redis-cli -h redis-b-master1 cluster info | grep -q 'cluster_size:3') && echo 'cluster-b already up' || redis-cli --cluster create redis-b-master1:6379 redis-b-master2:6379 redis-b-master3:6379 --cluster-replicas 0 --cluster-yes"]
+    networks: [replnet]
+
+  cluster-init-c:
+    image: redis:7-alpine
+    depends_on: [redis-c-master1, redis-c-master2, redis-c-master3]
+    restart: "no"
+    command: ["sh", "-c", "sleep 8 && (redis-cli -h redis-c-master1 cluster info | grep -q 'cluster_size:3') && echo 'cluster-c already up' || redis-cli --cluster create redis-c-master1:6379 redis-c-master2:6379 redis-c-master3:6379 --cluster-replicas 0 --cluster-yes"]
+    networks: [replnet]
+
+  # ─── Agents ───
+  agent-a:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/redibridge/agent.yaml"]
+    volumes:
+      - ../../../config/cluster/embedded-bus/agent-a.yaml:/etc/redibridge/agent.yaml:ro
+    ports: ["8291:8080", "9291:9090"]
+    depends_on: [cluster-init-a, cluster-init-b, cluster-init-c]
+    networks: [replnet]
+    restart: unless-stopped
+
+  agent-b:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/redibridge/agent.yaml"]
+    volumes:
+      - ../../../config/cluster/embedded-bus/agent-b.yaml:/etc/redibridge/agent.yaml:ro
+    ports: ["8292:8080", "9292:9090"]
+    depends_on: [cluster-init-a, cluster-init-b, cluster-init-c]
+    networks: [replnet]
+    restart: unless-stopped
+
+  agent-c:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/redibridge/agent.yaml"]
+    volumes:
+      - ../../../config/cluster/embedded-bus/agent-c.yaml:/etc/redibridge/agent.yaml:ro
+    ports: ["8293:8080", "9293:9090"]
+    depends_on: [cluster-init-a, cluster-init-b, cluster-init-c]
+    networks: [replnet]
+    restart: unless-stopped
+
+networks:
+  replnet:
+    driver: bridge
+
+volumes:
+  redis-a-master1-data:
+  redis-a-master2-data:
+  redis-a-master3-data:
+  redis-a-replica1-data:
+  redis-a-replica2-data:
+  redis-a-replica3-data:
+  redis-b-master1-data:
+  redis-b-master2-data:
+  redis-b-master3-data:
+  redis-c-master1-data:
+  redis-c-master2-data:
+  redis-c-master3-data:

@@ -53,7 +53,7 @@ func TestIntegrationWriteReplicates(t *testing.T) {
 	defer clientB.Close()
 
 	// Create bus
-	replBus := bus.NewRedisStreamsBus(busAddr, "", "repl:stream:", logger)
+	replBus := bus.NewRedisStreamsBus(busAddr, "", "repl:stream:", 1000000, logger)
 	defer replBus.Close()
 
 	// Setup agent A (producer)
@@ -119,7 +119,7 @@ func TestIntegrationLWWConvergence(t *testing.T) {
 	defer clientA.Close()
 	defer clientB.Close()
 
-	replBus := bus.NewRedisStreamsBus(busAddr, "", "repl:stream:", logger)
+	replBus := bus.NewRedisStreamsBus(busAddr, "", "repl:stream:", 1000000, logger)
 	defer replBus.Close()
 
 	// Setup agents for both clusters
@@ -179,7 +179,7 @@ func TestIntegrationHashReplication(t *testing.T) {
 	defer clientA.Close()
 	defer clientB.Close()
 
-	replBus := bus.NewRedisStreamsBus(busAddr, "", "repl:stream:", logger)
+	replBus := bus.NewRedisStreamsBus(busAddr, "", "repl:stream:", 1000000, logger)
 	defer replBus.Close()
 
 	clockA := hlc.New()

@@ -1,0 +1,87 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────
+# Standalone › Separate Bus
+# 3 single Redis instances (one per site) + 1 shared standalone bus Redis
+# Best for: local dev, simple non-HA deployments
+#
+# Port layout:
+#   redis-a / redis-b / redis-c : 6381 / 6382 / 6383
+#   redis-bus                   : 6390
+#   agent-a coordinator : 8081   metrics: 9091
+#   agent-b coordinator : 8082   metrics: 9092
+#   agent-c coordinator : 8083   metrics: 9093
+#
+# Usage:
+#   docker compose -f docker/standalone/separate-bus/docker-compose.yml up --build -d
+# ─────────────────────────────────────────────────────────────
+
+services:
+  redis-a:
+    image: redis:7-alpine
+    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    ports: ["6381:6379"]
+    networks: [replnet]
+
+  redis-b:
+    image: redis:7-alpine
+    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    ports: ["6382:6379"]
+    networks: [replnet]
+
+  redis-c:
+    image: redis:7-alpine
+    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    ports: ["6383:6379"]
+    networks: [replnet]
+
+  redis-bus:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --maxmemory 512mb
+      --maxmemory-policy noeviction
+      --save ""
+      --appendonly no
+    ports: ["6390:6379"]
+    networks: [replnet]
+
+  agent-a:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/redibridge/agent.yaml"]
+    volumes:
+      - ../../../config/standalone/separate-bus/agent-a.yaml:/etc/redibridge/agent.yaml:ro
+    ports: ["8081:8080", "9091:9090"]
+    depends_on: [redis-a, redis-bus]
+    networks: [replnet]
+    restart: unless-stopped
+
+  agent-b:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/redibridge/agent.yaml"]
+    volumes:
+      - ../../../config/standalone/separate-bus/agent-b.yaml:/etc/redibridge/agent.yaml:ro
+    ports: ["8082:8080", "9092:9090"]
+    depends_on: [redis-b, redis-bus]
+    networks: [replnet]
+    restart: unless-stopped
+
+  agent-c:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/redibridge/agent.yaml"]
+    volumes:
+      - ../../../config/standalone/separate-bus/agent-c.yaml:/etc/redibridge/agent.yaml:ro
+    ports: ["8083:8080", "9093:9090"]
+    depends_on: [redis-c, redis-bus]
+    networks: [replnet]
+    restart: unless-stopped
+
+networks:
+  replnet:
+    driver: bridge

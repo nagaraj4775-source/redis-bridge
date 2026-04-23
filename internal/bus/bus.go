@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -24,12 +25,22 @@ type Delta struct {
 	SeqID      string `json:"seq_id"`
 }
 
+// LagInfo captures consumer-group lag for one peer stream.
+type LagInfo struct {
+	StreamLen       int64  `json:"stream_len"`
+	Lag             int64  `json:"lag"`              // undelivered messages
+	Pending         int64  `json:"pending"`           // delivered but unacked
+	LastDeliveredID string `json:"last_delivered_id"` // last acked message ID
+	Consumers       int64  `json:"consumers"`
+}
+
 // Bus abstracts the replication transport so Kafka can be swapped in later.
 type Bus interface {
 	Publish(ctx context.Context, siteID string, delta Delta) error
-	Consume(ctx context.Context, peerSiteID string, group string, consumer string, batchSize int) ([]Message, error)
+	Consume(ctx context.Context, peerSiteID string, group string, consumer string, batchSize int, startID string) ([]Message, error)
 	Ack(ctx context.Context, peerSiteID string, group string, ids []string) error
 	StreamLen(ctx context.Context, siteID string) (int64, error)
+	GroupLag(ctx context.Context, peerSiteID, group string) (LagInfo, error)
 	EnsureGroup(ctx context.Context, peerSiteID, group string) error
 	Ping(ctx context.Context) error
 	Close() error
@@ -46,11 +57,13 @@ type RedisStreamsBus struct {
 	client       redis.UniversalClient
 	streamPrefix string
 	maxLen       int64
+	streamTTL    time.Duration // when > 0, MINID trimming is used instead of MAXLEN
 	logger       *zap.Logger
 }
 
 // NewRedisStreamsBus creates a new Redis Streams-backed bus for a standalone instance.
-func NewRedisStreamsBus(addr, password, streamPrefix string, logger *zap.Logger) *RedisStreamsBus {
+// streamTTL sets time-based retention (MINID trimming); when > 0 it takes priority over maxLen.
+func NewRedisStreamsBus(addr, password, streamPrefix string, maxLen int64, streamTTL time.Duration, logger *zap.Logger) *RedisStreamsBus {
 	client := redis.NewClient(&redis.Options{
 		Addr:         addr,
 		Password:     password,
@@ -62,14 +75,15 @@ func NewRedisStreamsBus(addr, password, streamPrefix string, logger *zap.Logger)
 	return &RedisStreamsBus{
 		client:       client,
 		streamPrefix: streamPrefix,
-		maxLen:       1000000,
+		maxLen:       maxLen,
+		streamTTL:    streamTTL,
 		logger:       logger,
 	}
 }
 
 // NewRedisStreamsBusSentinel creates a bus backed by a Redis Sentinel cluster.
-// Automatically follows master failover — no manual intervention needed.
-func NewRedisStreamsBusSentinel(masterName string, sentinelAddrs []string, password, streamPrefix string, logger *zap.Logger) *RedisStreamsBus {
+// streamTTL sets time-based retention (MINID trimming); when > 0 it takes priority over maxLen.
+func NewRedisStreamsBusSentinel(masterName string, sentinelAddrs []string, password, streamPrefix string, maxLen int64, streamTTL time.Duration, logger *zap.Logger) *RedisStreamsBus {
 	client := redis.NewFailoverClient(&redis.FailoverOptions{
 		MasterName:       masterName,
 		SentinelAddrs:    sentinelAddrs,
@@ -84,15 +98,15 @@ func NewRedisStreamsBusSentinel(masterName string, sentinelAddrs []string, passw
 	return &RedisStreamsBus{
 		client:       client,
 		streamPrefix: streamPrefix,
-		maxLen:       1000000,
+		maxLen:       maxLen,
+		streamTTL:    streamTTL,
 		logger:       logger,
 	}
 }
 
 // NewRedisStreamsBusCluster creates a bus backed by a Redis Cluster.
-// addrs is the list of cluster node addresses (bootstrap nodes); the client
-// discovers all nodes automatically.
-func NewRedisStreamsBusCluster(addrs []string, password, streamPrefix string, logger *zap.Logger) *RedisStreamsBus {
+// streamTTL sets time-based retention (MINID trimming); when > 0 it takes priority over maxLen.
+func NewRedisStreamsBusCluster(addrs []string, password, streamPrefix string, maxLen int64, streamTTL time.Duration, logger *zap.Logger) *RedisStreamsBus {
 	client := redis.NewClusterClient(&redis.ClusterOptions{
 		Addrs:        addrs,
 		Password:     password,
@@ -104,7 +118,8 @@ func NewRedisStreamsBusCluster(addrs []string, password, streamPrefix string, lo
 	return &RedisStreamsBus{
 		client:       client,
 		streamPrefix: streamPrefix,
-		maxLen:       1000000,
+		maxLen:       maxLen,
+		streamTTL:    streamTTL,
 		logger:       logger,
 	}
 }
@@ -119,21 +134,32 @@ func (b *RedisStreamsBus) streamName(siteID string) string {
 }
 
 // Publish writes a delta to the site's replication stream.
+// Trimming strategy (applied on every XADD):
+//   - streamTTL > 0 → MINID: trim entries whose ID (ms timestamp) is older than now-TTL.
+//   - maxLen > 0    → MAXLEN ~: keep at most maxLen entries (count-based, approximate).
+//   - neither set   → no trimming (unlimited growth).
 func (b *RedisStreamsBus) Publish(ctx context.Context, siteID string, delta Delta) error {
 	valBytes, err := json.Marshal(delta)
 	if err != nil {
 		return fmt.Errorf("marshal delta: %w", err)
 	}
 
-	stream := b.streamName(siteID)
-	return b.client.XAdd(ctx, &redis.XAddArgs{
-		Stream: stream,
-		MaxLen: b.maxLen,
+	args := &redis.XAddArgs{
+		Stream: b.streamName(siteID),
 		Approx: true,
 		Values: map[string]interface{}{
 			"data": string(valBytes),
 		},
-	}).Err()
+	}
+	if b.streamTTL > 0 {
+		// MINID uses the stream entry ID (which is "<unix-ms>-<seq>") as the
+		// trim boundary. Any entry with ID < minID is removed.
+		minMS := time.Now().Add(-b.streamTTL).UnixMilli()
+		args.MinID = strconv.FormatInt(minMS, 10) + "-0"
+	} else {
+		args.MaxLen = b.maxLen
+	}
+	return b.client.XAdd(ctx, args).Err()
 }
 
 // EnsureGroup creates the consumer group if it does not exist.
@@ -147,13 +173,15 @@ func (b *RedisStreamsBus) EnsureGroup(ctx context.Context, peerSiteID, group str
 }
 
 // Consume reads a batch of deltas from a peer's stream using consumer groups.
-func (b *RedisStreamsBus) Consume(ctx context.Context, peerSiteID string, group string, consumer string, batchSize int) ([]Message, error) {
+// startID=">" reads new undelivered messages; startID="0" re-reads the PEL
+// (messages delivered but not yet ACKed — used for crash recovery).
+func (b *RedisStreamsBus) Consume(ctx context.Context, peerSiteID string, group string, consumer string, batchSize int, startID string) ([]Message, error) {
 	stream := b.streamName(peerSiteID)
 
 	results, err := b.client.XReadGroup(ctx, &redis.XReadGroupArgs{
 		Group:    group,
 		Consumer: consumer,
-		Streams:  []string{stream, ">"},
+		Streams:  []string{stream, startID},
 		Count:    int64(batchSize),
 		Block:    100 * time.Millisecond,
 	}).Result()
@@ -199,6 +227,39 @@ func (b *RedisStreamsBus) Ack(ctx context.Context, peerSiteID string, group stri
 func (b *RedisStreamsBus) StreamLen(ctx context.Context, siteID string) (int64, error) {
 	stream := b.streamName(siteID)
 	return b.client.XLen(ctx, stream).Result()
+}
+
+// GroupLag returns consumer-group lag stats for a peer's stream.
+func (b *RedisStreamsBus) GroupLag(ctx context.Context, peerSiteID, group string) (LagInfo, error) {
+	stream := b.streamName(peerSiteID)
+
+	// XLEN routes by key slot (position 1) — always correct.
+	streamLen, _ := b.client.XLen(ctx, stream).Result()
+
+	// XInfoGroups args: ["xinfo", "groups", <stream>] — key is at position 2.
+	// go-redis defaults to position 1 ("groups"), causing wrong-shard routing in
+	// ClusterClient. SetFirstKeyPos(2) fixes the routing before Process is called.
+	cmd := redis.NewXInfoGroupsCmd(ctx, stream)
+	cmd.SetFirstKeyPos(2)
+	if err := b.client.Process(ctx, cmd); err != nil {
+		if err == redis.Nil || strings.Contains(err.Error(), "no such key") {
+			return LagInfo{StreamLen: streamLen}, nil
+		}
+		return LagInfo{StreamLen: streamLen}, fmt.Errorf("xinfo groups %s: %w", stream, err)
+	}
+
+	for _, g := range cmd.Val() {
+		if g.Name == group {
+			return LagInfo{
+				StreamLen:       streamLen,
+				Lag:             g.Lag,
+				Pending:         g.Pending,
+				LastDeliveredID: g.LastDeliveredID,
+				Consumers:       g.Consumers,
+			}, nil
+		}
+	}
+	return LagInfo{StreamLen: streamLen}, nil
 }
 
 // deadLetter sends unprocessable messages to a DLQ stream.

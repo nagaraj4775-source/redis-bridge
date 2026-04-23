@@ -141,6 +141,10 @@ func (c *Consumer) consumePeer(ctx context.Context, peerID string) {
 	logger := c.logger.With(zap.String("peer", peerID))
 	consumerName := c.siteID + "-consumer"
 
+	// Start by draining the PEL (messages delivered but not ACKed in a prior
+	// run). Once the PEL is empty, switch to ">" for new messages.
+	startID := "0"
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -160,8 +164,15 @@ func (c *Consumer) consumePeer(ctx context.Context, peerID string) {
 		c.cancelFn[peerID] = cancel
 		c.mu.Unlock()
 
-		msgs, err := c.bus.Consume(peerCtx, peerID, c.groupName(), consumerName, c.batchSize)
+		msgs, err := c.bus.Consume(peerCtx, peerID, c.groupName(), consumerName, c.batchSize, startID)
 		cancel()
+
+		// When reading PEL ("0") returns empty, the backlog is drained —
+		// switch to new messages (">").
+		if err == nil && len(msgs) == 0 && startID == "0" {
+			startID = ">"
+			continue
+		}
 
 		if err != nil {
 			if ctx.Err() != nil {
@@ -184,6 +195,47 @@ func (c *Consumer) consumePeer(ctx context.Context, peerID string) {
 			if err := c.bus.Ack(ctx, peerID, c.groupName(), ackIDs); err != nil {
 				logger.Error("ack error", zap.Error(err))
 			}
+		}
+
+		// If every message in the batch failed and the local cluster is
+		// unreachable, stop consuming new messages and wait for recovery.
+		// Once healthy, reset startID to "0" to re-drain the PEL.
+		if len(msgs) > 0 && len(ackIDs) == 0 {
+			if pingErr := c.localClient.Ping(ctx).Err(); pingErr != nil {
+				logger.Warn("local cluster unreachable, pausing consumption until recovery",
+					zap.Error(pingErr))
+				c.waitForLocalCluster(ctx, logger)
+				startID = "0" // re-drain PEL after recovery
+			}
+		}
+
+		// Any message that failed to apply (processOne returned false) stays in
+		// the PEL un-ACKed. Switch back to "0" so the next Consume call
+		// re-delivers those entries and retries them. This handles transient
+		// errors such as a partial cross-shard pipeline failure in the applier.
+		if len(ackIDs) < len(msgs) && startID == ">" {
+			startID = "0"
+		}
+	}
+}
+
+// waitForLocalCluster blocks with exponential backoff until the local Redis
+// cluster responds to PING or the context is cancelled.
+func (c *Consumer) waitForLocalCluster(ctx context.Context, logger *zap.Logger) {
+	backoff := 1 * time.Second
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if err := c.localClient.Ping(ctx).Err(); err == nil {
+			logger.Info("local cluster recovered, resuming consumption")
+			return
+		}
+		logger.Warn("local cluster still unreachable", zap.Duration("retry_in", backoff))
+		if backoff < 30*time.Second {
+			backoff *= 2
 		}
 	}
 }
@@ -219,6 +271,32 @@ func (c *Consumer) processMessages(ctx context.Context, peerID string, msgs []bu
 
 	wg.Wait()
 	return ackIDs
+}
+
+// PeerLag is the lag snapshot for a single peer, returned by PeerLags.
+type PeerLag struct {
+	SiteID string       `json:"site_id"`
+	Paused bool         `json:"paused"`
+	Stream bus.LagInfo  `json:"stream"`
+	Err    string       `json:"error,omitempty"`
+}
+
+// PeerLags returns a lag snapshot for every configured peer.
+func (c *Consumer) PeerLags(ctx context.Context) []PeerLag {
+	result := make([]PeerLag, 0, len(c.peers))
+	for _, peer := range c.peers {
+		info, err := c.bus.GroupLag(ctx, peer, c.groupName())
+		pl := PeerLag{
+			SiteID: peer,
+			Paused: c.IsPaused(peer),
+			Stream: info,
+		}
+		if err != nil {
+			pl.Err = err.Error()
+		}
+		result = append(result, pl)
+	}
+	return result
 }
 
 // keyLock returns the per-key mutex, creating it on first access.
@@ -279,15 +357,32 @@ func (c *Consumer) processOne(ctx context.Context, peerID string, msg bus.Messag
 	}
 
 	accepted := false
+	var lwwReason string
 	if localHLC == 0 {
 		// No meta = genuinely first write, always accept
 		accepted = true
+		lwwReason = "no_meta"
 	} else if delta.HLC > localHLC {
 		accepted = true
+		lwwReason = "hlc_newer"
 	} else if delta.HLC == localHLC && delta.SiteID > localSite {
 		// Deterministic tie-break: higher site_id wins
 		accepted = true
+		lwwReason = "tie_break"
+	} else {
+		lwwReason = "lww_lost"
 	}
+
+	logger.Info("LWW decision",
+		zap.String("key", delta.Key),
+		zap.String("peer", peerID),
+		zap.Uint64("delta_hlc", delta.HLC),
+		zap.Uint64("local_hlc", localHLC),
+		zap.String("delta_site", delta.SiteID),
+		zap.String("local_site", localSite),
+		zap.Bool("accepted", accepted),
+		zap.String("reason", lwwReason),
+	)
 
 	if !accepted {
 		metrics.WritesDiscarded.WithLabelValues(c.siteID, peerID, "lww_lost").Inc()
@@ -295,10 +390,13 @@ func (c *Consumer) processOne(ctx context.Context, peerID string, msg bus.Messag
 		return true
 	}
 
-	// Update HLC
-	c.clock.Update(delta.HLC)
-
-	// Apply delta
+	// Apply delta BEFORE advancing the clock. The applier sets the dedup
+	// shadow internally (MarkApplying) right before writing the value, so the
+	// producer's receipt-time shadow snapshot (taken in subscribeAndProcess)
+	// correctly distinguishes the original write event (shadow not yet set)
+	// from the Apply's write event (shadow set). Advancing the clock after
+	// Apply ensures producer goroutines that are stamping concurrent original-
+	// write events use the real wall clock, not an HLC inflated by Update().
 	start := time.Now()
 	if err := c.applier.Apply(ctx, delta); err != nil {
 		logger.Error("apply failed",
@@ -307,6 +405,10 @@ func (c *Consumer) processOne(ctx context.Context, peerID string, msg bus.Messag
 			zap.Error(err))
 		return false
 	}
+
+	// Advance HLC after apply so concurrent producer goroutines don't
+	// get an artificially higher timestamp for unrelated original writes.
+	c.clock.Update(delta.HLC)
 
 	elapsed := float64(time.Since(start).Milliseconds())
 	metrics.ApplyDuration.WithLabelValues(c.siteID, peerID).Observe(elapsed)

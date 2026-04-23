@@ -1,0 +1,191 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────
+# Sentinel › Embedded Bus
+# 3 sites × (1 master + 2 replicas + 3 sentinels) — NO separate bus.
+# Each site's master hosts its own replication stream.
+# Agents connect to peers' masters directly for stream consumption.
+#
+# Port layout:
+#   redis-a-master : 6421   redis-b-master : 6424   redis-c-master : 6427
+#   agent-a coordinator : 8391   metrics: 9391
+#   agent-b coordinator : 8392   metrics: 9392
+#   agent-c coordinator : 8393   metrics: 9393
+#
+# Usage:
+#   docker compose -f docker/sentinel/embedded-bus/docker-compose.yml up --build -d
+# ─────────────────────────────────────────────────────────────
+
+x-redis: &redis
+  image: redis:7-alpine
+
+services:
+  # ─── Site A: 1 master + 2 replicas ───
+  redis-a-master:
+    <<: *redis
+    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    ports: ["6421:6379"]
+    networks:
+      replnet:
+        aliases: [redis-a-master]
+
+  redis-a-replica1:
+    <<: *redis
+    command: redis-server --replicaof redis-a-master 6379 --save "" --appendonly no
+    depends_on: [redis-a-master]
+    networks: [replnet]
+
+  redis-a-replica2:
+    <<: *redis
+    command: redis-server --replicaof redis-a-master 6379 --save "" --appendonly no
+    depends_on: [redis-a-master]
+    networks: [replnet]
+
+  # ─── Site A: 3 sentinels ───
+  sentinel-a-1:
+    <<: *redis
+    command: redis-sentinel /etc/redis/sentinel.conf
+    volumes: [./sentinel-a.conf:/etc/redis/sentinel.conf:ro]
+    depends_on: [redis-a-master]
+    networks: [replnet]
+
+  sentinel-a-2:
+    <<: *redis
+    command: redis-sentinel /etc/redis/sentinel.conf
+    volumes: [./sentinel-a.conf:/etc/redis/sentinel.conf:ro]
+    depends_on: [redis-a-master]
+    networks: [replnet]
+
+  sentinel-a-3:
+    <<: *redis
+    command: redis-sentinel /etc/redis/sentinel.conf
+    volumes: [./sentinel-a.conf:/etc/redis/sentinel.conf:ro]
+    depends_on: [redis-a-master]
+    networks: [replnet]
+
+  # ─── Site B: 1 master + 2 replicas ───
+  redis-b-master:
+    <<: *redis
+    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    ports: ["6424:6379"]
+    networks:
+      replnet:
+        aliases: [redis-b-master]
+
+  redis-b-replica1:
+    <<: *redis
+    command: redis-server --replicaof redis-b-master 6379 --save "" --appendonly no
+    depends_on: [redis-b-master]
+    networks: [replnet]
+
+  redis-b-replica2:
+    <<: *redis
+    command: redis-server --replicaof redis-b-master 6379 --save "" --appendonly no
+    depends_on: [redis-b-master]
+    networks: [replnet]
+
+  # ─── Site B: 3 sentinels ───
+  sentinel-b-1:
+    <<: *redis
+    command: redis-sentinel /etc/redis/sentinel.conf
+    volumes: [./sentinel-b.conf:/etc/redis/sentinel.conf:ro]
+    depends_on: [redis-b-master]
+    networks: [replnet]
+
+  sentinel-b-2:
+    <<: *redis
+    command: redis-sentinel /etc/redis/sentinel.conf
+    volumes: [./sentinel-b.conf:/etc/redis/sentinel.conf:ro]
+    depends_on: [redis-b-master]
+    networks: [replnet]
+
+  sentinel-b-3:
+    <<: *redis
+    command: redis-sentinel /etc/redis/sentinel.conf
+    volumes: [./sentinel-b.conf:/etc/redis/sentinel.conf:ro]
+    depends_on: [redis-b-master]
+    networks: [replnet]
+
+  # ─── Site C: 1 master + 2 replicas ───
+  redis-c-master:
+    <<: *redis
+    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    ports: ["6427:6379"]
+    networks:
+      replnet:
+        aliases: [redis-c-master]
+
+  redis-c-replica1:
+    <<: *redis
+    command: redis-server --replicaof redis-c-master 6379 --save "" --appendonly no
+    depends_on: [redis-c-master]
+    networks: [replnet]
+
+  redis-c-replica2:
+    <<: *redis
+    command: redis-server --replicaof redis-c-master 6379 --save "" --appendonly no
+    depends_on: [redis-c-master]
+    networks: [replnet]
+
+  # ─── Site C: 3 sentinels ───
+  sentinel-c-1:
+    <<: *redis
+    command: redis-sentinel /etc/redis/sentinel.conf
+    volumes: [./sentinel-c.conf:/etc/redis/sentinel.conf:ro]
+    depends_on: [redis-c-master]
+    networks: [replnet]
+
+  sentinel-c-2:
+    <<: *redis
+    command: redis-sentinel /etc/redis/sentinel.conf
+    volumes: [./sentinel-c.conf:/etc/redis/sentinel.conf:ro]
+    depends_on: [redis-c-master]
+    networks: [replnet]
+
+  sentinel-c-3:
+    <<: *redis
+    command: redis-sentinel /etc/redis/sentinel.conf
+    volumes: [./sentinel-c.conf:/etc/redis/sentinel.conf:ro]
+    depends_on: [redis-c-master]
+    networks: [replnet]
+
+  # ─── Agents ───
+  agent-a:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/redibridge/agent.yaml"]
+    volumes:
+      - ../../../config/sentinel/embedded-bus/agent-a.yaml:/etc/redibridge/agent.yaml:ro
+    ports: ["8391:8080", "9391:9090"]
+    depends_on: [sentinel-a-1, sentinel-a-2, sentinel-a-3]
+    networks: [replnet]
+    restart: unless-stopped
+
+  agent-b:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/redibridge/agent.yaml"]
+    volumes:
+      - ../../../config/sentinel/embedded-bus/agent-b.yaml:/etc/redibridge/agent.yaml:ro
+    ports: ["8392:8080", "9392:9090"]
+    depends_on: [sentinel-b-1, sentinel-b-2, sentinel-b-3]
+    networks: [replnet]
+    restart: unless-stopped
+
+  agent-c:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/redibridge/agent.yaml"]
+    volumes:
+      - ../../../config/sentinel/embedded-bus/agent-c.yaml:/etc/redibridge/agent.yaml:ro
+    ports: ["8393:8080", "9393:9090"]
+    depends_on: [sentinel-c-1, sentinel-c-2, sentinel-c-3]
+    networks: [replnet]
+    restart: unless-stopped
+
+networks:
+  replnet:
+    driver: bridge

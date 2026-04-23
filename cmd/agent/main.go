@@ -94,6 +94,22 @@ func main() {
 	// Create producer
 	prod := producer.New(cfg.SiteID, masters, localClient, replBus, clock, dd, logger)
 
+	// In cluster mode, enable automatic re-subscription when a replica is
+	// promoted to master. The producer polls CLUSTER topology every 10 s and
+	// starts a new PubSub goroutine for any newly elected master.
+	if cfg.Cluster.Mode == config.ModeCluster {
+		if cc, ok := localClient.(*redis.ClusterClient); ok {
+			nodeOpts := &redis.Options{
+				Password:     cfg.Cluster.Password,
+				PoolSize:     4,
+				MinIdleConns: 1,
+				ReadTimeout:  3 * time.Second,
+				WriteTimeout: 3 * time.Second,
+			}
+			prod.WithClusterTopologyWatch(cc, nodeOpts)
+		}
+	}
+
 	// Create consumer
 	cons := consumer.New(
 		cfg.SiteID,
@@ -266,9 +282,10 @@ func buildClusterClients(ctx context.Context, cfg *config.Config, logger *zap.Lo
 
 // buildBusClient creates the replication bus based on the bus mode in config.
 func buildBusClient(cfg *config.Config, logger *zap.Logger) (bus.Bus, error) {
+	streamTTL := time.Duration(cfg.Bus.StreamTTLHours) * time.Hour
 	switch cfg.Bus.Mode {
 	case config.ModeStandalone:
-		return bus.NewRedisStreamsBus(cfg.Bus.Addr, cfg.Bus.Password, cfg.Bus.StreamPrefix, logger), nil
+		return bus.NewRedisStreamsBus(cfg.Bus.Addr, cfg.Bus.Password, cfg.Bus.StreamPrefix, cfg.Bus.StreamMaxLen, streamTTL, logger), nil
 
 	case config.ModeSentinel:
 		return bus.NewRedisStreamsBusSentinel(
@@ -276,6 +293,8 @@ func buildBusClient(cfg *config.Config, logger *zap.Logger) (bus.Bus, error) {
 			cfg.Bus.SentinelAddrs,
 			cfg.Bus.Password,
 			cfg.Bus.StreamPrefix,
+			cfg.Bus.StreamMaxLen,
+			streamTTL,
 			logger,
 		), nil
 
@@ -285,11 +304,11 @@ func buildBusClient(cfg *config.Config, logger *zap.Logger) (bus.Bus, error) {
 		if cfg.Cluster.Mode == config.ModeCluster {
 			// Cluster mode: use ClusterClient for the local bus and each peer bus.
 			// This ensures XADD/XREADGROUP are routed to the correct shard automatically.
-			localBus := bus.NewRedisStreamsBusCluster(cfg.Cluster.Masters, cfg.Bus.Password, cfg.Bus.StreamPrefix, logger)
+			localBus := bus.NewRedisStreamsBusCluster(cfg.Cluster.Masters, cfg.Bus.Password, cfg.Bus.StreamPrefix, cfg.Bus.StreamMaxLen, streamTTL, logger)
 			peerBuses := make(map[string]*bus.RedisStreamsBus, len(cfg.Bus.PeerBusAddrs))
 			for siteID, addr := range cfg.Bus.PeerBusAddrs {
 				// addr is a bootstrap node; ClusterClient discovers remaining nodes.
-				peerBuses[siteID] = bus.NewRedisStreamsBusCluster([]string{addr}, cfg.Bus.Password, cfg.Bus.StreamPrefix, logger)
+				peerBuses[siteID] = bus.NewRedisStreamsBusCluster([]string{addr}, cfg.Bus.Password, cfg.Bus.StreamPrefix, cfg.Bus.StreamMaxLen, streamTTL, logger)
 			}
 			return bus.NewPerPeerBusDirect(localBus, peerBuses, logger), nil
 		}
@@ -300,6 +319,8 @@ func buildBusClient(cfg *config.Config, logger *zap.Logger) (bus.Bus, error) {
 			cfg.Bus.PeerBusAddrs,
 			cfg.Bus.Password,
 			cfg.Bus.StreamPrefix,
+			cfg.Bus.StreamMaxLen,
+			streamTTL,
 			logger,
 		), nil
 

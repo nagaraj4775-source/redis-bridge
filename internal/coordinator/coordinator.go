@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -78,14 +79,12 @@ func (c *Coordinator) handleLag(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	peers := make([]map[string]interface{}, 0, len(c.cfg.Peers))
-	for _, peer := range c.cfg.Peers {
-		peers = append(peers, map[string]interface{}{
-			"site":   peer,
-			"paused": c.consumer.IsPaused(peer),
-		})
-	}
-	writeJSON(w, map[string]interface{}{"peers": peers})
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	writeJSON(w, map[string]interface{}{
+		"site_id": c.cfg.SiteID,
+		"peers":   c.consumer.PeerLags(ctx),
+	})
 }
 
 func (c *Coordinator) handleStats(w http.ResponseWriter, r *http.Request) {

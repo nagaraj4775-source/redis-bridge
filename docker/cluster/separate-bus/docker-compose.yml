@@ -1,0 +1,130 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────
+# Cluster › Separate Bus
+# 3 Redis Clusters (3 masters each) + 1 shared standalone bus Redis
+# Best for: Redis Cluster (sharded), high-throughput
+#
+# Port layout:
+#   redis-a-master1/2/3 : 6381 / 6382 / 6383
+#   redis-b-master1/2/3 : 6384 / 6385 / 6386
+#   redis-c-master1/2/3 : 6387 / 6388 / 6389
+#   redis-bus           : 6390
+#   agent-a coordinator : 8081   metrics: 9091
+#   agent-b coordinator : 8082   metrics: 9092
+#   agent-c coordinator : 8083   metrics: 9093
+#
+# Usage:
+#   docker compose -f docker/cluster/separate-bus/docker-compose.yml up --build -d
+# ─────────────────────────────────────────────────────────────
+
+services:
+  # ─── Cluster A Masters ───
+  redis-a-master1:
+    image: redis:7-alpine
+    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    ports: ["6381:6379"]
+    networks: [replnet]
+
+  redis-a-master2:
+    image: redis:7-alpine
+    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    ports: ["6382:6379"]
+    networks: [replnet]
+
+  redis-a-master3:
+    image: redis:7-alpine
+    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    ports: ["6383:6379"]
+    networks: [replnet]
+
+  # ─── Cluster B Masters ───
+  redis-b-master1:
+    image: redis:7-alpine
+    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    ports: ["6384:6379"]
+    networks: [replnet]
+
+  redis-b-master2:
+    image: redis:7-alpine
+    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    ports: ["6385:6379"]
+    networks: [replnet]
+
+  redis-b-master3:
+    image: redis:7-alpine
+    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    ports: ["6386:6379"]
+    networks: [replnet]
+
+  # ─── Cluster C Masters ───
+  redis-c-master1:
+    image: redis:7-alpine
+    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    ports: ["6387:6379"]
+    networks: [replnet]
+
+  redis-c-master2:
+    image: redis:7-alpine
+    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    ports: ["6388:6379"]
+    networks: [replnet]
+
+  redis-c-master3:
+    image: redis:7-alpine
+    command: redis-server --notify-keyspace-events KEA --save "" --appendonly no
+    ports: ["6389:6379"]
+    networks: [replnet]
+
+  # ─── Replication Bus ───
+  redis-bus:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --maxmemory 512mb
+      --maxmemory-policy noeviction
+      --save ""
+      --appendonly no
+    ports: ["6390:6379"]
+    networks: [replnet]
+
+  # ─── Agents ───
+  agent-a:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/redibridge/agent.yaml"]
+    volumes:
+      - ../../../config/cluster/separate-bus/agent-a.yaml:/etc/redibridge/agent.yaml:ro
+    ports: ["8081:8080", "9091:9090"]
+    depends_on: [redis-a-master1, redis-a-master2, redis-a-master3, redis-bus]
+    networks: [replnet]
+    restart: unless-stopped
+
+  agent-b:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/redibridge/agent.yaml"]
+    volumes:
+      - ../../../config/cluster/separate-bus/agent-b.yaml:/etc/redibridge/agent.yaml:ro
+    ports: ["8082:8080", "9092:9090"]
+    depends_on: [redis-b-master1, redis-b-master2, redis-b-master3, redis-bus]
+    networks: [replnet]
+    restart: unless-stopped
+
+  agent-c:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/redibridge/agent.yaml"]
+    volumes:
+      - ../../../config/cluster/separate-bus/agent-c.yaml:/etc/redibridge/agent.yaml:ro
+    ports: ["8083:8080", "9093:9090"]
+    depends_on: [redis-c-master1, redis-c-master2, redis-c-master3, redis-bus]
+    networks: [replnet]
+    restart: unless-stopped
+
+networks:
+  replnet:
+    driver: bridge

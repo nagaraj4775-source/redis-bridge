@@ -1,0 +1,39 @@
+# ─ Site identity ────────────────────────────────────────────────────────────
+site_id: "site-c"           # Unique name for this site — used in stream names and LWW resolution
+
+# ─ Local Redis connection ────────────────────────────────────────────────────
+cluster:
+  mode: "standalone"        # standalone | sentinel | cluster
+  addr: "redis-c:6379"      # Redis address (standalone mode only)
+  password: ""              # Redis AUTH password ("" = no auth)
+  tls: false                # Set true to enable TLS for the Redis connection
+
+# ─ Replication bus ───────────────────────────────────────────────────────────
+bus:
+  mode: "standalone"        # standalone = dedicated shared bus Redis instance
+  addr: "redis-bus:6379"    # Address of the shared bus Redis
+  stream_prefix: "repl:stream:"      # Key prefix for all replication streams (stream = prefix + site_id)
+  consumer_group: "repl-consumers"   # Consumer group name (scoped per site internally)
+  stream_max_len: 1000000   # Max entries retained per stream; oldest trimmed on each write (0 = unlimited)
+  stream_ttl_hours: 0   # Time-based retention: trim entries older than N hours (0 = disabled; takes priority over stream_max_len when set)
+  password: ""              # Bus Redis AUTH password ("" = no auth)
+
+# ─ Peer sites to replicate from ─────────────────────────────────────────────
+peers:
+  - "site-a"                # Must match the site_id of the peer's agent config
+  - "site-b"
+
+# ─ Replication tuning ────────────────────────────────────────────────────────
+replication:
+  batch_size: 100           # Messages fetched per XREADGROUP call per peer
+  apply_concurrency: 8      # Parallel goroutines applying messages from a single peer stream
+  dedup_ttl_seconds: 5      # Shadow key TTL (seconds) used to suppress replication loops
+  max_in_flight: 1000       # Max unacknowledged messages before the consumer pauses (backpressure)
+
+# ─ HTTP coordinator API ──────────────────────────────────────────────────────
+coordinator:
+  port: 8080                # Serves: GET /lag  GET /pause  GET /resume  GET /status
+
+# ─ Prometheus metrics ────────────────────────────────────────────────────────
+metrics:
+  port: 9090                # Prometheus scrape endpoint at http://host:9090/metrics

@@ -55,14 +55,19 @@ var trackedCommands = map[string]bool{
 
 // Producer listens for keyspace events on Redis masters and publishes deltas.
 type Producer struct {
-	siteID     string
-	masters    []*redis.Client      // per-node clients for PSubscribe only
-	dataClient redis.UniversalClient // for meta/shadow/reader ops (auto-routes in cluster)
-	bus        bus.Bus
-	clock      *hlc.HLC
-	dedup      *dedup.Filter
-	logger     *zap.Logger
-	seqNo      atomic.Uint64
+	siteID        string
+	masters       []*redis.Client      // per-node clients for PSubscribe only
+	clusterClient *redis.ClusterClient // non-nil in cluster mode; used for topology watch
+	nodeOpts      *redis.Options       // base opts for creating dynamic per-node clients
+	dataClient    redis.UniversalClient
+	bus           bus.Bus
+	clock         *hlc.HLC
+	dedup         *dedup.Filter
+	logger        *zap.Logger
+	seqNo         atomic.Uint64
+
+	subMu  sync.Mutex
+	subSet map[string]context.CancelFunc // master addr → cancel func
 }
 
 // New creates a new Producer.
@@ -78,7 +83,20 @@ func New(siteID string, masters []*redis.Client, dataClient redis.UniversalClien
 		clock:      clock,
 		dedup:      dd,
 		logger:     logger,
+		subSet:     make(map[string]context.CancelFunc),
 	}
+}
+
+// WithClusterTopologyWatch enables automatic re-subscription when a replica is
+// promoted to master. The producer polls CLUSTER topology every 10 s:
+//   - new master detected → ConfigSet KEA + start PubSub goroutine
+//   - master no longer in cluster → cancel its subscription context
+//
+// Call this immediately after New() for cluster-mode deployments.
+func (p *Producer) WithClusterTopologyWatch(cc *redis.ClusterClient, baseOpts *redis.Options) *Producer {
+	p.clusterClient = cc
+	p.nodeOpts = baseOpts
+	return p
 }
 
 // Run starts keyspace listeners on all masters. Blocks until ctx is cancelled.
@@ -86,25 +104,137 @@ func (p *Producer) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 
 	for i, master := range p.masters {
-		// Enable keyspace notifications
 		if err := master.ConfigSet(ctx, "notify-keyspace-events", "KEA").Err(); err != nil {
 			p.logger.Warn("failed to set notify-keyspace-events, may already be set",
 				zap.Int("master", i), zap.Error(err))
 		}
 
+		addr := master.Options().Addr
+		subCtx, cancel := context.WithCancel(ctx)
+
+		p.subMu.Lock()
+		p.subSet[addr] = cancel
+		p.subMu.Unlock()
+
 		wg.Add(1)
-		go func(idx int, client *redis.Client) {
+		go func(idx int, client *redis.Client, sCtx context.Context, a string) {
 			defer wg.Done()
-			p.listenMaster(ctx, idx, client)
-		}(i, master)
+			defer func() {
+				p.subMu.Lock()
+				delete(p.subSet, a)
+				p.subMu.Unlock()
+			}()
+			p.listenMaster(sCtx, idx, client)
+		}(i, master, subCtx, addr)
+	}
+
+	// Topology watcher runs alongside subscriptions in cluster mode and
+	// re-subscribes to promoted replicas within one reconcile interval (~10s).
+	if p.clusterClient != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p.watchTopology(ctx)
+		}()
 	}
 
 	wg.Wait()
 	return nil
 }
 
+// watchTopology polls CLUSTER topology every 10 s and reconciles subscriptions.
+func (p *Producer) watchTopology(ctx context.Context) {
+	p.reconcileMasters(ctx) // immediate first pass
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.reconcileMasters(ctx)
+		}
+	}
+}
+
+// reconcileMasters compares the cluster's current master set with active
+// subscriptions. Promoted replicas get a new PubSub goroutine; masters that
+// are no longer in the cluster have their subscription context cancelled.
+func (p *Producer) reconcileMasters(ctx context.Context) {
+	// Force the ClusterClient to re-read CLUSTER SLOTS so we see any
+	// replica promotions that happened since the last refresh.
+	p.clusterClient.ReloadState(ctx)
+
+	var addrMu sync.Mutex
+	currentAddrs := make(map[string]struct{})
+	if err := p.clusterClient.ForEachMaster(ctx, func(_ context.Context, c *redis.Client) error {
+		addrMu.Lock()
+		currentAddrs[c.Options().Addr] = struct{}{}
+		addrMu.Unlock()
+		return nil
+	}); err != nil {
+		p.logger.Warn("topology reconcile: ForEachMaster failed", zap.Error(err))
+		return
+	}
+
+	p.subMu.Lock()
+
+	// Cancel subscriptions for masters that left the cluster
+	for addr, cancel := range p.subSet {
+		if _, active := currentAddrs[addr]; !active {
+			p.logger.Info("master left cluster, cancelling subscription", zap.String("addr", addr))
+			cancel()
+			delete(p.subSet, addr)
+		}
+	}
+
+	// Collect new masters (promoted replicas) and register placeholder to
+	// prevent a second reconcile from double-starting the same address.
+	var toStart []string
+	for addr := range currentAddrs {
+		if _, exists := p.subSet[addr]; !exists {
+			toStart = append(toStart, addr)
+			p.subSet[addr] = func() {} // placeholder
+		}
+	}
+
+	p.subMu.Unlock()
+
+	for _, addr := range toStart {
+		optsCopy := *p.nodeOpts
+		optsCopy.Addr = addr
+		c := redis.NewClient(&optsCopy)
+
+		if err := c.ConfigSet(ctx, "notify-keyspace-events", "KEA").Err(); err != nil {
+			p.logger.Warn("failed to set notify-keyspace-events on promoted master",
+				zap.String("addr", addr), zap.Error(err))
+		}
+
+		subCtx, cancel := context.WithCancel(ctx)
+
+		p.subMu.Lock()
+		p.subSet[addr] = cancel // replace placeholder with real cancel
+		p.subMu.Unlock()
+
+		p.logger.Info("replica promoted to master, starting subscription", zap.String("addr", addr))
+
+		go func(a string, cl *redis.Client, sCtx context.Context) {
+			p.listenMaster(sCtx, -1, cl)
+			cl.Close()
+			p.subMu.Lock()
+			delete(p.subSet, a)
+			p.subMu.Unlock()
+		}(addr, c, subCtx)
+	}
+}
+
 func (p *Producer) listenMaster(ctx context.Context, idx int, client *redis.Client) {
-	logger := p.logger.With(zap.Int("master", idx))
+	var logger *zap.Logger
+	if idx >= 0 {
+		logger = p.logger.With(zap.Int("master", idx))
+	} else {
+		logger = p.logger.With(zap.String("master_addr", client.Options().Addr))
+	}
 
 	for {
 		select {
@@ -125,7 +255,13 @@ func (p *Producer) subscribeAndProcess(ctx context.Context, idx int, client *red
 	pubsub := client.PSubscribe(ctx, "__keyevent@*__:*")
 	defer pubsub.Close()
 
-	ch := pubsub.Channel()
+	ch := pubsub.Channel(redis.WithChannelSize(100000))
+
+	// Semaphore limits concurrent event handlers so events are dispatched
+	// immediately (not queued behind serial processing). This keeps the
+	// shadow-key TTL check valid even during 100k-key bulk operations.
+	const workerConcurrency = 50
+	sem := make(chan struct{}, workerConcurrency)
 
 	for {
 		select {
@@ -135,7 +271,11 @@ func (p *Producer) subscribeAndProcess(ctx context.Context, idx int, client *red
 			if !ok {
 				return fmt.Errorf("pubsub channel closed")
 			}
-			p.handleEvent(ctx, msg, logger)
+			sem <- struct{}{}
+			go func(m *redis.Message) {
+				defer func() { <-sem }()
+				p.handleEvent(ctx, m, logger)
+			}(msg)
 		}
 	}
 }
@@ -157,17 +297,6 @@ func (p *Producer) handleEvent(ctx context.Context, msg *redis.Message, logger *
 		return
 	}
 
-	// Check if this is a replication write (loop prevention).
-	// Uses dataClient so shadow key lookup auto-routes in cluster mode.
-	applying, err := p.dedup.IsApplying(ctx, key)
-	if err != nil {
-		logger.Warn("dedup check failed", zap.String("key", key), zap.Error(err))
-		return
-	}
-	if applying {
-		return
-	}
-
 	// Read key value and TTL via dataClient (auto-routes to correct shard in cluster mode).
 	keyType, value, err := reader.ReadValue(ctx, p.dataClient, key)
 	if err != nil {
@@ -179,6 +308,20 @@ func (p *Producer) handleEvent(ctx context.Context, msg *redis.Message, logger *
 			logger.Debug("failed to read key value", zap.String("key", key), zap.Error(err))
 			return
 		}
+	}
+
+	// Value-hash loop prevention: the shadow stores a CRC32 of the value the
+	// consumer just applied. If the current key value matches that hash, this
+	// keyspace event was triggered by the Apply's SET → skip (prevents infinite
+	// replication loops). If the hash differs, a new user write overwrote the
+	// applied value → publish so all sites learn about it.
+	shadowHash, err := p.dedup.ApplyingHash(ctx, key)
+	if err != nil {
+		logger.Warn("dedup check failed", zap.String("key", key), zap.Error(err))
+		return
+	}
+	if shadowHash > 0 && dedup.ValueHash(value) == shadowHash {
+		return
 	}
 
 	ttlMs, err := reader.ReadTTL(ctx, p.dataClient, key)
@@ -220,7 +363,9 @@ func (p *Producer) handleEvent(ctx context.Context, msg *redis.Message, logger *
 	if keyType == "none" {
 		p.dataClient.Del(ctx, metaKey)
 	} else {
-		metaCAS.Run(ctx, p.dataClient, []string{metaKey}, strconv.FormatUint(ts, 10), p.siteID)
+		if err := metaCAS.Run(ctx, p.dataClient, []string{metaKey}, strconv.FormatUint(ts, 10), p.siteID).Err(); err != nil {
+			logger.Warn("metaCAS failed", zap.String("key", key), zap.String("metaKey", metaKey), zap.Error(err))
+		}
 	}
 
 	// Publish to bus

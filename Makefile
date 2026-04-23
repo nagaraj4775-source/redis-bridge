@@ -117,13 +117,13 @@ test-e2e-embedded-down:
 
 # ── Embedded-Cluster (3 sites × 3 masters, NO dedicated bus) ────────────────
 up-embedded-cluster:
-	docker compose -f docker/embedded-cluster/docker-compose.yml up --build -d
+	docker compose -f docker/cluster/embedded-bus/docker-compose.yml up --build -d
 
 down-embedded-cluster:
-	docker compose -f docker/embedded-cluster/docker-compose.yml down -v
+	docker compose -f docker/cluster/embedded-bus/docker-compose.yml down -v
 
 logs-embedded-cluster:
-	docker compose -f docker/embedded-cluster/docker-compose.yml logs -f
+	docker compose -f docker/cluster/embedded-bus/docker-compose.yml logs -f
 
 # ── E2E Tests — Embedded-Cluster mode ────────────────────────────────────────
 #
@@ -132,22 +132,22 @@ logs-embedded-cluster:
 # test-e2e-embedded-cluster-down: tear down
 
 test-e2e-embedded-cluster: up-embedded-cluster
-	@echo "==> Waiting 10s for agents to warm up..."
-	@sleep 10
+	@echo "==> Waiting 20s for clusters to form and agents to warm up..."
+	@sleep 20
 	@echo "==> Running Embedded-Cluster E2E tests..."
 	$(GO) test -v -timeout 120s -run "^TestEmbeddedCluster" ./tests/
 
 test-e2e-embedded-cluster-ci: up-embedded-cluster
-	@echo "==> Waiting 10s for agents to warm up..."
-	@sleep 10
+	@echo "==> Waiting 20s for clusters to form and agents to warm up..."
+	@sleep 20
 	@echo "==> Running Embedded-Cluster E2E tests..."
 	$(GO) test -v -timeout 120s -run "^TestEmbeddedCluster" ./tests/; \
 	  EXIT=$$?; \
-	  docker compose -f docker/embedded-cluster/docker-compose.yml down -v; \
+	  docker compose -f docker/cluster/embedded-bus/docker-compose.yml down -v; \
 	  exit $$EXIT
 
 test-e2e-embedded-cluster-down:
-	docker compose -f docker/embedded-cluster/docker-compose.yml down -v
+	docker compose -f docker/cluster/embedded-bus/docker-compose.yml down -v
 
 # ── Misc ───────────────────────────────────────────────────────────────────────
 clean:

@@ -1,7 +1,7 @@
 # config/ — Agent Configuration Reference
 
-Each subfolder is a **complete, ready-to-use** set of agent configs for one deployment topology.
-Pick the folder that matches your Redis setup, then copy and edit the three YAML files.
+Configs are organised by **Redis topology** then **bus type**.
+Pick the folder matching your setup, copy and edit the three YAML files.
 
 ---
 
@@ -10,43 +10,44 @@ Pick the folder that matches your Redis setup, then copy and edit the three YAML
 ```
 What does your Redis look like at each site?
 │
-├── Single Redis instance (no HA, no sharding)
-│   │
-│   ├── I have / can deploy a dedicated bus Redis  →  standalone/
-│   └── I want NO extra Redis containers           →  embedded/
+├── standalone/   Single Redis instance (no HA, no sharding)
+│   ├── separate-bus/   → dedicated shared bus Redis
+│   └── embedded-bus/   → no extra Redis; stream on each site's own instance
 │
-├── Redis Sentinel (master + replicas + sentinels, automatic failover)
-│   └── (always uses a Sentinel bus)               →  sentinel/
+├── sentinel/     Redis Sentinel (master + replicas + sentinels, auto-failover)
+│   ├── separate-bus/   → dedicated HA Sentinel bus cluster
+│   └── embedded-bus/   → no extra Redis; stream on each site's master
 │
-└── Redis Cluster (multiple masters, data sharded)
-    │
-    ├── I have / can deploy a dedicated bus Redis  →  cluster/
-    └── I want NO extra Redis containers           →  embedded-cluster/
+└── cluster/      Redis Cluster (sharded, multiple masters)
+    ├── separate-bus/   → dedicated shared bus Redis
+    └── embedded-bus/   → no extra Redis; stream on master1 of each site
 ```
 
 ---
 
 ## Folder index
 
-| Folder | Redis topology per site | Bus | Extra Redis needed? | Docker Compose |
+| Config path | Redis topology | Bus | Extra Redis? | Docker Compose |
 |---|---|---|---|---|
-| `standalone/` | 1 single instance | Dedicated standalone Redis | ✅ Yes — 1 shared bus | `docker/standalone/` |
-| `sentinel/` | 1 master + replicas + sentinels | Dedicated Sentinel Redis | ✅ Yes — HA bus cluster | `docker/sentinel/` |
-| `cluster/` | 3 masters (sharded cluster) | Dedicated standalone Redis | ✅ Yes — 1 shared bus | `docker/cluster/` |
-| `embedded/` | 1 single instance | **None — stream on site's own Redis** | ❌ No extra Redis | `docker/embedded/` |
-| `embedded-cluster/` | 3 masters (sharded cluster) | **None — stream on master1** | ❌ No extra Redis | `docker/embedded-cluster/` |
+| `standalone/separate-bus/` | 1 instance | Standalone Redis | ✅ Yes | `docker/standalone/separate-bus/` |
+| `standalone/embedded-bus/` | 1 instance | **None** | ❌ No | `docker/standalone/embedded-bus/` |
+| `sentinel/separate-bus/` | Sentinel HA | Sentinel HA Redis | ✅ Yes | `docker/sentinel/separate-bus/` |
+| `sentinel/embedded-bus/` | Sentinel HA | **None** | ❌ No | `docker/sentinel/embedded-bus/` |
+| `cluster/separate-bus/` | Redis Cluster | Standalone Redis | ✅ Yes | `docker/cluster/separate-bus/` |
+| `cluster/embedded-bus/` | Redis Cluster | **None** | ❌ No | `docker/cluster/embedded-bus/` |
 
 ---
 
 ## Port reference
 
-| Folder | Redis ports | Coordinator API | Metrics |
+| Config path | Redis ports | API ports | Metrics ports |
 |---|---|---|---|
-| `standalone/` | 6381–6383 (+ bus 6390) | 8081 / 8082 / 8083 | 9091 / 9092 / 9093 |
-| `sentinel/` | masters 6381–6383, bus 6390 | 8081 / 8082 / 8083 | 9091 / 9092 / 9093 |
-| `cluster/` | 6381–6389 (+ bus 6390) | 8081 / 8082 / 8083 | 9091 / 9092 / 9093 |
-| `embedded/` | 6401 / 6402 / 6403 | 8191 / 8192 / 8193 | 9191 / 9192 / 9193 |
-| `embedded-cluster/` | 6411–6419 | 8291 / 8292 / 8293 | 9291 / 9292 / 9293 |
+| `standalone/separate-bus/` | 6381–6383, bus 6390 | 8081–8083 | 9091–9093 |
+| `standalone/embedded-bus/` | 6401–6403 | 8191–8193 | 9191–9193 |
+| `sentinel/separate-bus/` | masters 6381/6384/6387, bus 6390 | 8081–8083 | 9091–9093 |
+| `sentinel/embedded-bus/` | masters 6421/6424/6427 | 8391–8393 | 9391–9393 |
+| `cluster/separate-bus/` | 6381–6389, bus 6390 | 8081–8083 | 9091–9093 |
+| `cluster/embedded-bus/` | 6411–6419 | 8291–8293 | 9291–9293 |
 
 ---
 
@@ -62,7 +63,7 @@ agent-c.yaml   ← Site C config
 
 To add a 4th site: copy `agent-c.yaml`, change `site_id`, add the new site to every
 other agent's `peers:` list, and add its bus address to every other agent's
-`bus.peer_bus_addrs` (embedded modes only).
+`bus.peer_bus_addrs` (embedded-bus modes only).
 
 ---
 

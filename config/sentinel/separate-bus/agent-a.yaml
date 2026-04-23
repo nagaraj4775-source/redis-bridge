@@ -1,0 +1,61 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# SENTINEL › SEPARATE BUS
+# Redis Sentinel HA per site + dedicated HA Sentinel bus
+# ══════════════════════════════════════════════════════════════════════════════
+# Use when:
+#   • Each site needs automatic master failover (1 master + replicas + sentinels)
+#   • You want the replication bus to also be HA (its own Sentinel set)
+#
+# Docker Compose : docker/sentinel/separate-bus/docker-compose.yml
+# Redis per site : 1 master + 2 replicas + 3 sentinels per site
+# Bus            : dedicated Sentinel HA cluster (bus-master + 3 bus-sentinels)
+# Ports          : Masters 6381/6384/6387 | Bus 6390 | API 8081-8083 | Metrics 9091-9093
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ─ Site identity ────────────────────────────────────────────────────────────
+site_id: "site-a"           # Unique name for this site — used in stream names and LWW resolution
+
+# ─ Local Redis connection (Sentinel HA) ──────────────────────────────────────────
+cluster:
+  mode: "sentinel"          # sentinel = Sentinel-managed HA (auto failover)
+  sentinel_master: "mymaster-a"       # Sentinel master group name (matches sentinel.conf)
+  sentinel_addrs:           # List of sentinel nodes — any 1 alive is enough to bootstrap
+    - "sentinel-a-1:26379"
+    - "sentinel-a-2:26379"
+    - "sentinel-a-3:26379"
+  password: ""              # Redis AUTH password ("" = no auth)
+  tls: false                # Set true to enable TLS for the Redis connection
+
+# ─ Replication bus (Sentinel HA) ─────────────────────────────────────────────────
+bus:
+  mode: "sentinel"          # sentinel = bus backed by its own HA Sentinel cluster
+  sentinel_master: "bus-master"       # Bus sentinel master group name (matches sentinel-bus.conf)
+  sentinel_addrs:           # Bus sentinel nodes — separate from the data sentinels
+    - "bus-sentinel-1:26379"
+    - "bus-sentinel-2:26379"
+    - "bus-sentinel-3:26379"
+  stream_prefix: "repl:stream:"      # Key prefix for all replication streams (stream = prefix + site_id)
+  consumer_group: "repl-consumers"   # Consumer group name (scoped per site internally)
+  stream_max_len: 1000000   # Max entries retained per stream; oldest trimmed on each write (0 = unlimited)
+  stream_ttl_hours: 0   # Time-based retention: trim entries older than N hours (0 = disabled; takes priority over stream_max_len when set)
+  password: ""              # Bus Redis AUTH password ("" = no auth)
+
+# ─ Peer sites to replicate from ─────────────────────────────────────────────
+peers:
+  - "site-b"                # Must match the site_id of the peer's agent config
+  - "site-c"
+
+# ─ Replication tuning ────────────────────────────────────────────────────────
+replication:
+  batch_size: 100           # Messages fetched per XREADGROUP call per peer
+  apply_concurrency: 8      # Parallel goroutines applying messages from a single peer stream
+  dedup_ttl_seconds: 5      # Shadow key TTL (seconds) used to suppress replication loops
+  max_in_flight: 1000       # Max unacknowledged messages before the consumer pauses (backpressure)
+
+# ─ HTTP coordinator API ──────────────────────────────────────────────────────
+coordinator:
+  port: 8080                # Serves: GET /lag  GET /pause  GET /resume  GET /status
+
+# ─ Prometheus metrics ────────────────────────────────────────────────────────
+metrics:
+  port: 9090                # Prometheus scrape endpoint at http://host:9090/metrics
