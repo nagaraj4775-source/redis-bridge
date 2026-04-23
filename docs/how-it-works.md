@@ -250,7 +250,7 @@ If both are `0`, the stream grows indefinitely.
 | **HLC Clock** | `internal/clock/` | Provides monotonic, distributed-safe timestamps |
 | **Bus** | `internal/bus/` | Abstraction over Redis Streams (standalone / sentinel / cluster) |
 | **Config** | `internal/config/config.go` | YAML config loader with validation |
-| **Coordinator** | `internal/coordinator/` | HTTP API: `/status`, `/lag`, `/pause`, `/resume` |
+| **Coordinator** | `internal/coordinator/` | HTTP API: `/health`, `/lag`, `/stats`, `/config`, `/pause`, `/resume` |
 
 ---
 

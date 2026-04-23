@@ -10,10 +10,11 @@ Agents are running on all sites and accessible via their HTTP coordinator port.
 All examples assume a 3-site cluster setup. Adjust container names, hostnames, and ports to match your deployment.
 
 ```bash
-# Define shorthands for the examples below
-REDIS_A="redis-cli -c -h redis-a-master1 -p 6379"
-REDIS_B="redis-cli -c -h redis-b-master1 -p 6379"
-REDIS_C="redis-cli -c -h redis-c-master1 -p 6379"
+# Redis shorthands — these include the Docker exec prefix for the embedded-bus demo.
+# Adjust container names if your deployment differs.
+REDIS_A="sudo docker exec embedded-bus-redis-a-master1-1 redis-cli -c -h redis-a-master1"
+REDIS_B="sudo docker exec embedded-bus-redis-b-master1-1 redis-cli -c -h redis-b-master1"
+REDIS_C="sudo docker exec embedded-bus-redis-c-master1-1 redis-cli -c -h redis-c-master1"
 
 # Agent HTTP ports (set in coordinator.port in your agent config)
 AGENT_A="http://localhost:8291"
@@ -21,22 +22,22 @@ AGENT_B="http://localhost:8292"
 AGENT_C="http://localhost:8293"
 ```
 
-> If running via Docker, prefix each `redis-cli` command with:  
-> `sudo docker exec <container-name> redis-cli ...`
+> For non-Docker deployments, set the shorthands without `sudo docker exec`:  
+> `REDIS_A="redis-cli -c -h redis-a-master1 -p 6379"`
 
 ---
 
 ## Step 1 — Confirm Agents are Healthy
 
 ```bash
-curl $AGENT_A/status
-curl $AGENT_B/status
-curl $AGENT_C/status
+curl $AGENT_A/health
+curl $AGENT_B/health
+curl $AGENT_C/health
 ```
 
 **Expected response:**
 ```json
-{"site_id":"ec-site-a","status":"ok","uptime_s":42}
+{"status":"ok","site_id":"ec-site-a","uptime_s":42}
 ```
 
 If `status` is not `ok`, check agent logs:
@@ -125,11 +126,15 @@ Key fields in the delta JSON:
 
 ## Step 5 — Check the Meta Key (LWW Record)
 
-The producer writes a `__meta:{key}` hash to record the last-seen HLC for each key.  
+The producer writes a `__meta:<key>` hash to record the last-seen HLC for each key.  
 Consumers compare incoming deltas against this to decide whether to accept or reject.
 
+> **Key format:** The meta key is literally `__meta:` + the key name with no extra braces.  
+> For key `validate:test1` the meta key is `__meta:validate:test1`.  
+> It lives on the same Redis cluster shard as the key itself.
+
 ```bash
-$REDIS_A HGETALL __meta:{validate:test1}
+$REDIS_A HGETALL __meta:validate:test1
 ```
 
 **Expected:**
@@ -140,6 +145,10 @@ $REDIS_A HGETALL __meta:{validate:test1}
 4) "ec-site-a"
 ```
 
+> **Empty result?** The meta key only exists after the producer processes the keyspace event.  
+> Check that `PUBSUB NUMPAT` returns `1` (Step 2) and that `XLEN repl:stream:ec-site-a` grew (Step 4).  
+> In cluster mode, `-c` flag in the shorthand above ensures automatic redirect to the correct shard.
+
 ---
 
 ## Step 6 — Check Consumer Groups and Offsets
@@ -148,30 +157,37 @@ Each agent consumes the peer sites' streams using Redis consumer groups.
 To check site-b's and site-c's consumption progress on site-a's stream:
 
 ```bash
-# Run on site-a's Redis — shows all consumers reading repl:stream:ec-site-a
+# Run on site-a's Redis — shows all consumer groups reading repl:stream:ec-site-a
 $REDIS_A XINFO GROUPS repl:stream:ec-site-a
 ```
+
+> **Group name format:** `<consumer_group>-<consuming_site_id>` — for example, site-b and site-c each
+> create their own group on site-a's stream: `repl-consumers-ec-site-b` and `repl-consumers-ec-site-c`.
 
 **Key fields to check:**
 
 | Field               | Expected | Meaning                                         |
 |---------------------|----------|-------------------------------------------------|
-| `name`              | `repl-consumers` | Consumer group name                   |
-| `consumers`         | 2        | Number of active consumers (one per peer site)  |
+| `name`              | `repl-consumers-ec-site-b` | Consumer group name (one per consuming site) |
+| `consumers`         | 1        | Number of active consumers in this group        |
 | `pending`           | 0        | Delivered but not yet ACKed (backlog)           |
 | `last-delivered-id` | latest ID | Last entry handed to a consumer               |
 | `lag`               | 0        | Entries in stream not yet delivered             |
 
 ```bash
-# Drill into individual consumers within the group
-$REDIS_A XINFO CONSUMERS repl:stream:ec-site-a repl-consumers
+# Drill into individual consumers within a group
+# Group name = repl-consumers-<consuming_site_id>
+$REDIS_A XINFO CONSUMERS repl:stream:ec-site-a repl-consumers-ec-site-b
 ```
 
 ---
 
 ## Step 7 — Check Lag via the Agent API
 
-The `/lag` endpoint gives real-time lag per peer stream consumed by that agent.
+The `/lag` endpoint reports how far behind **this agent** is when reading each peer's stream.
+
+> `/lag` on agent-a shows lag for streams site-a **reads FROM** (site-b and site-c).  
+> If you wrote 1 key on site-a and check `/lag` on agent-a, `stream_len` for site-b will be 0 — that is expected because nothing was written on site-b yet.
 
 ```bash
 curl $AGENT_A/lag   # how far behind is site-a when reading site-b and site-c?
@@ -179,19 +195,43 @@ curl $AGENT_B/lag
 curl $AGENT_C/lag
 ```
 
-**Expected (healthy state):**
+**Actual response format:**
 ```json
 {
-  "ec-site-b": {"lag": 0, "pending": 0, "stream_len": 1500, "last_delivered_id": "..."},
-  "ec-site-c": {"lag": 0, "pending": 0, "stream_len": 1500, "last_delivered_id": "..."}
+  "site_id": "ec-site-a",
+  "peers": [
+    {
+      "site_id": "ec-site-b",
+      "paused": false,
+      "stream": {
+        "stream_len": 1,
+        "lag": 0,
+        "pending": 0,
+        "last_delivered_id": "1776877115814-0",
+        "consumers": 1
+      }
+    },
+    {
+      "site_id": "ec-site-c",
+      "paused": false,
+      "stream": {
+        "stream_len": 0,
+        "lag": 0,
+        "pending": 0,
+        "last_delivered_id": "",
+        "consumers": 0
+      }
+    }
+  ]
 }
 ```
 
-| Field         | Healthy | Concern                                          |
-|---------------|---------|--------------------------------------------------|
-| `lag`         | 0       | > 0 means catching up or agent is slow/stuck     |
-| `pending`     | 0       | > 0 means messages delivered but not ACKed yet   |
-| `stream_len`  | any     | Total entries ever written to that stream        |
+| Field                    | Healthy | Concern                                              |
+|--------------------------|---------|------------------------------------------------------|
+| `stream.lag`             | 0       | > 0 means catching up or agent is slow/stuck         |
+| `stream.pending`         | 0       | > 0 means messages delivered but not ACKed yet       |
+| `stream.stream_len`      | any     | Total entries ever written to that peer's own stream |
+| `stream.stream_len` = 0  | ok      | That peer has never written any keys — not an error  |
 
 ---
 
@@ -220,19 +260,25 @@ Key metrics to watch:
 
 Validate that pausing stops consumption and resuming catches up cleanly.
 
-```bash
-# Pause site-a's consumption (stops reading peer streams)
-curl -X POST $AGENT_A/pause
+> Both `/pause` and `/resume` require a JSON body specifying **which peer** to pause/resume.
 
-# Write keys on site-b while site-a is paused
+```bash
+# Pause site-a's consumption of site-b's stream
+curl -X POST $AGENT_A/pause \
+  -H "Content-Type: application/json" \
+  -d '{"site":"ec-site-b"}'
+
+# Write a key on site-b while site-a is paused
 $REDIS_B SET validate:paused-key "written-while-paused"
 sleep 1
 
-# Confirm site-a has lag (it missed the write)
+# Confirm site-a has lag for site-b (stream.lag > 0)
 curl $AGENT_A/lag
 
 # Resume — site-a will catch up automatically
-curl -X POST $AGENT_A/resume
+curl -X POST $AGENT_A/resume \
+  -H "Content-Type: application/json" \
+  -d '{"site":"ec-site-b"}'
 sleep 2
 
 # Confirm site-a caught up
@@ -246,14 +292,17 @@ echo -n "Site-A: "; $REDIS_A GET validate:paused-key
 Use this if a consumer is stuck on a corrupt entry, or you need to replay history.
 
 ```bash
+# Group name format: repl-consumers-<consuming_site_id>
+# Run this on the PEER's Redis (site-b's Redis, not site-a's) since the stream lives there
+
 # Reset to only consume NEW entries going forward (skip all history)
-$REDIS_A XGROUP SETID repl:stream:ec-site-b repl-consumers $
+$REDIS_B XGROUP SETID repl:stream:ec-site-b repl-consumers-ec-site-a $
 
 # Reset to replay ALL entries from the beginning
-$REDIS_A XGROUP SETID repl:stream:ec-site-b repl-consumers 0
+$REDIS_B XGROUP SETID repl:stream:ec-site-b repl-consumers-ec-site-a 0
 
 # Reset to a specific entry ID
-$REDIS_A XGROUP SETID repl:stream:ec-site-b repl-consumers 1776877115814-0
+$REDIS_B XGROUP SETID repl:stream:ec-site-b repl-consumers-ec-site-a 1776877115814-0
 ```
 
 > After resetting, restart the consuming agent so it picks up the new offset:
@@ -281,7 +330,7 @@ echo -n "Site-B: "; $REDIS_B GET validate:lww
 echo -n "Site-C: "; $REDIS_C GET validate:lww
 
 # Check which site's write won
-$REDIS_A HGETALL __meta:{validate:lww}
+$REDIS_A HGETALL __meta:validate:lww
 ```
 
 **Pass criteria:** All 3 sites show the **same value** (either `from-site-a` or `from-site-b`).  
@@ -460,12 +509,12 @@ sudo docker exec embedded-bus-redis-b-master1-1 \
 Run through this checklist before going live:
 
 ```
-[ ] curl /status on all agents returns "ok"
+[ ] curl /health on all agents returns {"status":"ok",...}
 [ ] PUBSUB NUMPAT = 1 on each Redis master (producer subscribed)
 [ ] XLEN repl:stream:<site> grows after writes
 [ ] XINFO GROUPS shows lag=0 and pending=0 for all consumer groups
 [ ] curl /lag on all agents returns lag=0 for all peers
-[ ] __meta:{key} hash exists on the originating site after a write
+[ ] __meta:<key> hash exists on the originating site after a write (e.g. __meta:validate:test1)
 [ ] LWW test: all 3 sites converge to the same value after concurrent writes
 [ ] Catch-up test: restarted agent replays all missed entries and reaches lag=0
 
