@@ -6,6 +6,24 @@ import (
 )
 
 var (
+	// Agent identity / config info — value always 1; metadata carried in labels.
+	// Displayed in Grafana as a table or stat panel to show site name, peers, role, TTL.
+	AgentInfo = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "repl_agent_info",
+		Help: "Static agent configuration info (value=1). Use labels for site, role, peers, stream TTL.",
+	}, []string{"site_id", "role", "peers", "stream_ttl_hours", "consumer_id"})
+
+	AgentUptimeSeconds = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "repl_agent_uptime_seconds",
+		Help: "Seconds since agent started",
+	}, []string{"site_id"})
+
+	// Peer connectivity — 1 = GroupLag call succeeded (peer reachable), 0 = error
+	PeerUp = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "repl_peer_up",
+		Help: "1 if the peer's stream is reachable, 0 if the last GroupLag call failed",
+	}, []string{"site_id", "peer_site"})
+
 	// Counters
 	EventsCaptured = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "repl_events_captured_total",
@@ -42,6 +60,16 @@ var (
 		Name: "repl_bus_stream_length",
 		Help: "Length of each replication stream",
 	}, []string{"stream"})
+
+	PendingEntries = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "repl_pending_entries",
+		Help: "Delivered but unACKed stream entries per peer (in-flight)",
+	}, []string{"site_id", "peer_site"})
+
+	ConsumerGroupLag = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "repl_consumer_group_lag",
+		Help: "Undelivered stream entries per peer (consumer group lag)",
+	}, []string{"site_id", "peer_site"})
 
 	// Histograms
 	ApplyDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{

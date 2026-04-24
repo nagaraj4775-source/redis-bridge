@@ -114,6 +114,32 @@ func (c *Consumer) Run(ctx context.Context) error {
 		}(peer)
 	}
 
+	// Background goroutine: poll GroupLag every 5s and push to Prometheus.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				for _, peer := range c.peers {
+					info, err := c.bus.GroupLag(ctx, peer, c.groupName())
+					if err != nil {
+						metrics.PeerUp.WithLabelValues(c.siteID, peer).Set(0)
+						continue
+					}
+					metrics.PeerUp.WithLabelValues(c.siteID, peer).Set(1)
+					metrics.BusStreamLength.WithLabelValues("repl:stream:" + peer).Set(float64(info.StreamLen))
+					metrics.PendingEntries.WithLabelValues(c.siteID, peer).Set(float64(info.Pending))
+					metrics.ConsumerGroupLag.WithLabelValues(c.siteID, peer).Set(float64(info.Lag))
+				}
+			}
+		}
+	}()
+
 	wg.Wait()
 	return nil
 }

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/nagaraju/redibridge/internal/coordinator"
 	"github.com/nagaraju/redibridge/internal/dedup"
 	"github.com/nagaraju/redibridge/internal/hlc"
+	"github.com/nagaraju/redibridge/internal/metrics"
 	"github.com/nagaraju/redibridge/internal/producer"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
@@ -58,6 +60,15 @@ func main() {
 		zap.String("consumer_id", consumerID),
 		zap.Strings("masters", cfg.Cluster.Masters),
 		zap.Strings("peers", cfg.Peers))
+
+	// Publish static agent info metric (value=1, metadata in labels).
+	metrics.AgentInfo.WithLabelValues(
+		cfg.SiteID,
+		cfg.Role,
+		strings.Join(cfg.Peers, ","),
+		fmt.Sprintf("%d", cfg.Bus.StreamTTLHours),
+		consumerID,
+	).Set(1)
 
 	// Context with signal handling
 	ctx, cancel := context.WithCancel(context.Background())
@@ -203,6 +214,24 @@ func main() {
 	} else {
 		logger.Info("role=producer: consumer disabled")
 	}
+
+	// Background uptime gauge — updated every 5s
+	startedAt := time.Now()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				metrics.AgentUptimeSeconds.WithLabelValues(cfg.SiteID).
+					Set(time.Since(startedAt).Seconds())
+			}
+		}
+	}()
 
 	logger.Info("redibridge started",
 		zap.String("site_id", cfg.SiteID),

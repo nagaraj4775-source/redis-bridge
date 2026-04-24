@@ -1,0 +1,556 @@
+{
+  "__inputs": [],
+  "__requires": [
+    {"type": "grafana", "id": "grafana", "name": "Grafana", "version": "9.0.0"},
+    {"type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0"}
+  ],
+  "annotations": {"list": []},
+  "description": "Live replication metrics for RedisBridge — producing, syncing, lag, pending, stream length, apply performance",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "id": 100,
+      "title": "Agent Identity & Status",
+      "type": "row"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+          "unit": "s",
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 5, "w": 4, "x": 0, "y": 1},
+      "id": 101,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [
+        {
+          "expr": "repl_agent_uptime_seconds",
+          "legendFormat": "{{site_id}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "Agent Uptime",
+      "type": "stat"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "green", "value": 1}
+            ]
+          },
+          "mappings": [
+            {"options": {"0": {"text": "DOWN"}, "1": {"text": "UP"}}, "type": "value"}
+          ],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 5, "w": 8, "x": 4, "y": 1},
+      "id": 102,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "center", "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value_and_name"},
+      "targets": [
+        {
+          "expr": "repl_peer_up",
+          "legendFormat": "{{site_id}} → {{peer_site}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "Peer Status (UP / DOWN)",
+      "description": "Green = peer stream reachable. Red = GroupLag call failed (peer offline or network issue).",
+      "type": "stat"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "left",
+            "displayMode": "auto",
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "stream_ttl_hours"}, "properties": [{"id": "displayName", "value": "Stream TTL (hours)"}, {"id": "custom.width", "value": 140}]},
+          {"matcher": {"id": "byName", "options": "site_id"}, "properties": [{"id": "displayName", "value": "Site"}, {"id": "custom.width", "value": 120}]},
+          {"matcher": {"id": "byName", "options": "role"}, "properties": [{"id": "displayName", "value": "Role"}, {"id": "custom.width", "value": 100}]},
+          {"matcher": {"id": "byName", "options": "peers"}, "properties": [{"id": "displayName", "value": "Peer Sites"}, {"id": "custom.width", "value": 200}]},
+          {"matcher": {"id": "byName", "options": "consumer_id"}, "properties": [{"id": "displayName", "value": "Consumer ID"}, {"id": "custom.width", "value": 200}]}
+        ]
+      },
+      "gridPos": {"h": 5, "w": 12, "x": 12, "y": 1},
+      "id": 103,
+      "options": {"footer": {"show": false}, "showHeader": true},
+      "transformations": [
+        {"id": "labelsToFields", "options": {"mode": "columns"}},
+        {"id": "organize", "options": {"excludeByName": {"Time": true, "Value": true, "__name__": true}}}
+      ],
+      "targets": [
+        {
+          "expr": "repl_agent_info",
+          "legendFormat": "",
+          "refId": "A",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "title": "Agent Configuration (Site · Role · Peers · Stream TTL · Consumer ID)",
+      "type": "table"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 6},
+      "id": 1,
+      "title": "Producer — Publishing",
+      "type": "row"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 10},
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 7},
+      "id": 2,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "expr": "rate(repl_events_captured_total[1m])",
+          "legendFormat": "{{site_id}} / {{key_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Events Captured Rate (keyspace events seen)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 10},
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 7},
+      "id": 3,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "expr": "rate(repl_events_published_total[1m])",
+          "legendFormat": "{{site_id}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Events Published to Stream (rate/s)",
+      "type": "timeseries"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 15},
+      "id": 10,
+      "title": "Consumer — Syncing",
+      "type": "row"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 10},
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 16},
+      "id": 11,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "expr": "rate(repl_events_consumed_total[1m])",
+          "legendFormat": "{{site_id}} ← {{peer_site}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Events Consumed from Peers (rate/s)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 10},
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 16},
+      "id": 12,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "expr": "rate(repl_writes_applied_total[1m])",
+          "legendFormat": "{{site_id}} ← {{peer_site}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Writes Applied to Local Redis (rate/s)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 10},
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 16},
+      "id": 13,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "expr": "rate(repl_writes_discarded_total[1m])",
+          "legendFormat": "{{site_id}} ← {{peer_site}} [{{reason}}]",
+          "refId": "A"
+        }
+      ],
+      "title": "Writes Discarded (rate/s) — by reason",
+      "description": "Reasons: lww_lost (LWW rejected older write), dedup_hit (already applied), loopback (own event echoed back)",
+      "type": "timeseries"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 24},
+      "id": 20,
+      "title": "Lag, Stream Length & Pending Entries",
+      "type": "row"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 10},
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 100},
+              {"color": "red", "value": 500}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 25},
+      "id": 21,
+      "options": {"legend": {"calcs": ["lastNotNull", "max", "mean"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "expr": "repl_lag_ms",
+          "legendFormat": "{{site_id}} ← {{peer_site}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Replication Lag (ms) — time from write to apply",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 10},
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 1000},
+              {"color": "red", "value": 10000}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 25},
+      "id": 22,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "expr": "repl_consumer_group_lag",
+          "legendFormat": "lag: {{site_id}} ← {{peer_site}}",
+          "refId": "A"
+        },
+        {
+          "expr": "repl_pending_entries",
+          "legendFormat": "pending: {{site_id}} ← {{peer_site}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Consumer Group Lag & Pending Entries (stream entries)",
+      "description": "lag = entries not yet delivered to any consumer. pending = delivered but not yet ACKed.",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 10},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 33},
+      "id": 23,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "expr": "repl_bus_stream_length",
+          "legendFormat": "{{stream}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Replication Stream Length (total entries ever written)",
+      "description": "Total entries in each site's replication stream. Grows with each write. Trimmed by stream_max_len or stream_ttl_hours.",
+      "type": "timeseries"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 41},
+      "id": 30,
+      "title": "Apply Performance",
+      "type": "row"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 10},
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 14, "x": 0, "y": 42},
+      "id": 31,
+      "options": {"legend": {"calcs": ["lastNotNull", "mean", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(repl_apply_duration_ms_bucket[1m]))",
+          "legendFormat": "p50 {{site_id}} ← {{peer_site}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(repl_apply_duration_ms_bucket[1m]))",
+          "legendFormat": "p95 {{site_id}} ← {{peer_site}}",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(repl_apply_duration_ms_bucket[1m]))",
+          "legendFormat": "p99 {{site_id}} ← {{peer_site}}",
+          "refId": "C"
+        }
+      ],
+      "title": "Apply Duration p50 / p95 / p99 (ms)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "palette-classic"}, "unit": "short"},
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 10, "x": 14, "y": 42},
+      "id": 32,
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom"},
+        "tooltip": {"mode": "multi"}
+      },
+      "targets": [
+        {
+          "expr": "rate(repl_writes_applied_total[1m])",
+          "legendFormat": "applied {{site_id}} ← {{peer_site}}",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(repl_events_published_total[1m])",
+          "legendFormat": "published {{site_id}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Publish vs Apply Throughput (ops/s)",
+      "description": "Comparing producer publish rate against consumer apply rate. Gap = lag building up.",
+      "type": "timeseries"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 50},
+      "id": 40,
+      "title": "Totals (Counters)",
+      "type": "row"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]},
+          "unit": "short",
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 51},
+      "id": 41,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [
+        {
+          "expr": "sum(repl_events_published_total) or vector(0)",
+          "legendFormat": "Total Published",
+          "refId": "A"
+        }
+      ],
+      "title": "Total Events Published",
+      "type": "stat"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+          "unit": "short",
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 51},
+      "id": 42,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [
+        {
+          "expr": "sum(repl_writes_applied_total) or vector(0)",
+          "legendFormat": "Total Applied",
+          "refId": "A"
+        }
+      ],
+      "title": "Total Writes Applied",
+      "type": "stat"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "yellow", "value": null}, {"color": "orange", "value": 100}, {"color": "red", "value": 1000}]},
+          "unit": "short",
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 51},
+      "id": 43,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [
+        {
+          "expr": "sum(repl_writes_discarded_total) or vector(0)",
+          "legendFormat": "Total Discarded",
+          "refId": "A"
+        }
+      ],
+      "title": "Total Writes Discarded",
+      "type": "stat"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 100}, {"color": "red", "value": 5000}]},
+          "unit": "short",
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 51},
+      "id": 44,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [
+        {
+          "expr": "sum(repl_consumer_group_lag) or vector(0)",
+          "legendFormat": "Total Lag",
+          "refId": "A"
+        }
+      ],
+      "title": "Total Consumer Group Lag (all streams)",
+      "type": "stat"
+    }
+
+  ],
+  "refresh": "5s",
+  "schemaVersion": 37,
+  "style": "dark",
+  "tags": ["redibridge", "replication"],
+  "time": {"from": "now-15m", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "RedisBridge — Live Replication Metrics",
+  "uid": "redibridge-live",
+  "version": 1
+}

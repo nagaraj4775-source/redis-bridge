@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: redibridge
+    static_configs:
+      - targets:
+          - agent-a:9090
+          - agent-b:9090
+          - agent-c:9090
+        labels:
+          deployment: embedded-bus

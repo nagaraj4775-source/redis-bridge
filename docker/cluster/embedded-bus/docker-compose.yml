@@ -166,12 +166,45 @@ services:
     networks: [replnet]
     restart: unless-stopped
 
+  # ─── Observability ───
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports: ["9090:9090"]
+    depends_on: [agent-a, agent-b, agent-c]
+    networks: [replnet]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/etc/grafana/dashboards/redibridge.json
+    volumes:
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+    networks: [replnet]
+    restart: unless-stopped
+
 networks:
   replnet:
     driver: bridge
 
 volumes:
   redis-a-master1-data:
+  prometheus-data:
+  grafana-data:
   redis-a-master2-data:
   redis-a-master3-data:
   redis-a-replica1-data:
