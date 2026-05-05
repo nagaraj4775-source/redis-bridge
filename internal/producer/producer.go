@@ -3,6 +3,7 @@ package producer
 import (
 	"context"
 	"fmt"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -53,6 +54,44 @@ var trackedCommands = map[string]bool{
 	"rename": true, "copy": true,
 }
 
+// ReconcileStatus is a JSON-serialisable snapshot of the last reconciler cycle.
+type ReconcileStatus struct {
+	Enabled      bool      `json:"enabled"`
+	LastRunAt    time.Time `json:"last_run_at,omitempty"`
+	LastScanMs   int64     `json:"last_scan_ms"`
+	LastRepaired int       `json:"last_repaired"`
+	TotalRuns    int64     `json:"total_runs"`
+}
+
+// BootstrapStatus is a JSON-serialisable snapshot of bootstrap progress.
+type BootstrapStatus struct {
+	State      string    `json:"state"` // idle | running | done | done_with_errors | cancelled
+	StartedAt  time.Time `json:"started_at,omitempty"`
+	FinishedAt time.Time `json:"finished_at,omitempty"`
+	Published  int64     `json:"published"`
+	Errors     int64     `json:"errors"`
+	ErrorMsg   string    `json:"error_msg,omitempty"`
+}
+
+// KeyStatus is a JSON-serialisable snapshot of a single key's replication state.
+type KeyStatus struct {
+	Key        string `json:"key"`
+	Published  bool   `json:"published"`
+	HLC        uint64 `json:"hlc"`
+	OriginSite string `json:"origin_site"`
+}
+
+// bootstrapProgress holds live counters for an in-flight bootstrap.
+// Atomic fields allow the status endpoint to read them without a lock.
+type bootstrapProgress struct {
+	state      string
+	startedAt  time.Time
+	finishedAt time.Time
+	published  atomic.Int64
+	errors     atomic.Int64
+	errMsg     string
+}
+
 // Producer listens for keyspace events on Redis masters and publishes deltas.
 type Producer struct {
 	siteID            string
@@ -67,6 +106,20 @@ type Producer struct {
 	seqNo             atomic.Uint64
 	reconcileInterval time.Duration // 0 = disabled
 
+	// Pattern filtering (Feature 5)
+	includeGlobs []string // if non-empty, key must match at least one
+	excludeGlobs []string // key must not match any
+
+	// On-demand reconcile trigger and status (Feature 1)
+	reconcileTrigger  chan struct{}
+	reconcileStatusMu sync.Mutex
+	reconcileStatus   ReconcileStatus
+
+	// Bootstrap sync state (Feature 6)
+	bootstrapMu     sync.Mutex
+	bootstrapProg   *bootstrapProgress
+	bootstrapCancel context.CancelFunc
+
 	subMu  sync.Mutex
 	subSet map[string]context.CancelFunc // master addr → cancel func
 }
@@ -77,15 +130,18 @@ type Producer struct {
 // dataClient is used for all data operations and can be a ClusterClient for automatic routing.
 func New(siteID string, masters []*redis.Client, dataClient redis.UniversalClient, b bus.Bus, clock *hlc.HLC, dd *dedup.Filter, logger *zap.Logger) *Producer {
 	return &Producer{
-		siteID:            siteID,
-		masters:           masters,
-		dataClient:        dataClient,
-		bus:               b,
-		clock:             clock,
-		dedup:             dd,
-		logger:            logger,
-		subSet:            make(map[string]context.CancelFunc),
+		siteID:           siteID,
+		masters:          masters,
+		dataClient:       dataClient,
+		bus:              b,
+		clock:            clock,
+		dedup:            dd,
+		logger:           logger,
+		subSet:           make(map[string]context.CancelFunc),
 		reconcileInterval: 30 * time.Second, // default; override with WithReconcileInterval
+		reconcileTrigger: make(chan struct{}, 1),
+		reconcileStatus:  ReconcileStatus{Enabled: true},
+		bootstrapProg:    &bootstrapProgress{state: "idle"},
 	}
 }
 
@@ -106,6 +162,107 @@ func (p *Producer) WithClusterTopologyWatch(cc *redis.ClusterClient, baseOpts *r
 	p.clusterClient = cc
 	p.nodeOpts = baseOpts
 	return p
+}
+
+// WithPatternFilter sets the include/exclude glob patterns for key filtering.
+// If includeGlobs is non-empty, only keys matching at least one pattern are replicated.
+// Keys matching any excludeGlob are always skipped, regardless of includeGlobs.
+// Uses standard glob syntax: * matches any sequence, ? matches one character.
+// Example: WithPatternFilter([]string{"users:*","orders:*"}, []string{"cache:*"})
+func (p *Producer) WithPatternFilter(includeGlobs, excludeGlobs []string) *Producer {
+	p.includeGlobs = includeGlobs
+	p.excludeGlobs = excludeGlobs
+	return p
+}
+
+// TriggerReconcile requests an immediate reconciler cycle without waiting for
+// the next scheduled tick. Returns true if the trigger was accepted, false if
+// a trigger is already queued (idempotent — safe to call multiple times).
+func (p *Producer) TriggerReconcile() bool {
+	select {
+	case p.reconcileTrigger <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// SyncKey force-publishes a specific key to the replication stream regardless
+// of its __meta: anchor state. Bypasses dedup and pattern filters.
+// Useful for post-incident recovery of a known missing key.
+func (p *Producer) SyncKey(ctx context.Context, key string) {
+	p.handleEvent(ctx, &redis.Message{
+		Channel: "__keyevent@0__:set",
+		Payload: key,
+	}, 0, p.logger)
+}
+
+// GetReconcileStatus returns a snapshot of the last reconciler cycle.
+func (p *Producer) GetReconcileStatus() ReconcileStatus {
+	p.reconcileStatusMu.Lock()
+	defer p.reconcileStatusMu.Unlock()
+	return p.reconcileStatus
+}
+
+// KeyStatus reads the __meta:{key} hash and returns the key's replication state.
+// Returns Published=false if the key has never been replicated.
+func (p *Producer) KeyStatus(ctx context.Context, key string) (KeyStatus, error) {
+	vals, err := p.dataClient.HGetAll(ctx, "__meta:"+key).Result()
+	if err != nil {
+		return KeyStatus{Key: key}, fmt.Errorf("HGETALL __meta:%s: %w", key, err)
+	}
+	if len(vals) == 0 {
+		return KeyStatus{Key: key, Published: false}, nil
+	}
+	ks := KeyStatus{Key: key, Published: true, OriginSite: vals["site"]}
+	if hlcStr, ok := vals["hlc"]; ok {
+		if v, err := strconv.ParseUint(hlcStr, 10, 64); err == nil {
+			ks.HLC = v
+		}
+	}
+	return ks, nil
+}
+
+// StartBootstrap triggers a one-time full-scan publish of all data keys.
+// Only one bootstrap can run at a time; returns error if one is already running.
+// The bootstrap respects pattern filters. Use GetBootstrapStatus to track progress.
+func (p *Producer) StartBootstrap(ctx context.Context) error {
+	p.bootstrapMu.Lock()
+	defer p.bootstrapMu.Unlock()
+	if p.bootstrapProg.state == "running" {
+		return fmt.Errorf("bootstrap already running (published=%d)", p.bootstrapProg.published.Load())
+	}
+	bCtx, cancel := context.WithCancel(ctx)
+	p.bootstrapCancel = cancel
+	prog := &bootstrapProgress{state: "running", startedAt: time.Now()}
+	p.bootstrapProg = prog
+	metrics.BootstrapInProgress.WithLabelValues(p.siteID).Set(1)
+	go p.runBootstrap(bCtx, prog)
+	return nil
+}
+
+// StopBootstrap cancels a running bootstrap. No-op if not running.
+func (p *Producer) StopBootstrap() {
+	p.bootstrapMu.Lock()
+	defer p.bootstrapMu.Unlock()
+	if p.bootstrapCancel != nil {
+		p.bootstrapCancel()
+	}
+}
+
+// GetBootstrapStatus returns a snapshot of the current or last bootstrap.
+func (p *Producer) GetBootstrapStatus() BootstrapStatus {
+	p.bootstrapMu.Lock()
+	prog := p.bootstrapProg
+	p.bootstrapMu.Unlock()
+	return BootstrapStatus{
+		State:      prog.state,
+		StartedAt:  prog.startedAt,
+		FinishedAt: prog.finishedAt,
+		Published:  prog.published.Load(),
+		Errors:     prog.errors.Load(),
+		ErrorMsg:   prog.errMsg,
+	}
 }
 
 // Run starts keyspace listeners on all masters. Blocks until ctx is cancelled.
@@ -271,6 +428,9 @@ func (p *Producer) reconcileMasters(ctx context.Context) {
 func (p *Producer) runReconciler(ctx context.Context) {
 	if p.reconcileInterval <= 0 {
 		p.logger.Info("reconciler: disabled (reconcile_interval_seconds=0)")
+		p.reconcileStatusMu.Lock()
+		p.reconcileStatus.Enabled = false
+		p.reconcileStatusMu.Unlock()
 		return
 	}
 	settleDelay := p.reconcileInterval / 3
@@ -289,6 +449,9 @@ func (p *Producer) runReconciler(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-p.reconcileTrigger:
+			p.logger.Info("reconciler: manual trigger received")
+			p.reconcileMissedEvents(ctx, settleDelay)
 		case <-ticker.C:
 			p.reconcileMissedEvents(ctx, settleDelay)
 		}
@@ -296,12 +459,18 @@ func (p *Producer) runReconciler(ctx context.Context) {
 }
 
 func (p *Producer) reconcileMissedEvents(ctx context.Context, settleDelay time.Duration) {
+	scanStart := time.Now()
 	candidates, err := p.scanMissingMeta(ctx)
+	scanMs := time.Since(scanStart).Milliseconds()
+
 	if err != nil {
 		p.logger.Warn("reconciler: scan failed", zap.Error(err))
 		return
 	}
+	metrics.ReconcilerScanDurationMs.WithLabelValues(p.siteID).Observe(float64(scanMs))
+
 	if len(candidates) == 0 {
+		p.updateReconcileStatus(scanMs, 0)
 		return
 	}
 	p.logger.Info("reconciler: keys without meta (settling)",
@@ -331,11 +500,23 @@ func (p *Producer) reconcileMissedEvents(ctx context.Context, settleDelay time.D
 	}
 	if republished > 0 {
 		p.logger.Info("reconciler: done", zap.Int("republished", republished))
+		metrics.ReconcilerRepairedTotal.WithLabelValues(p.siteID).Add(float64(republished))
 	}
+	metrics.ReconcilerRunsTotal.WithLabelValues(p.siteID).Inc()
+	p.updateReconcileStatus(scanMs, republished)
+}
+
+func (p *Producer) updateReconcileStatus(scanMs int64, repaired int) {
+	p.reconcileStatusMu.Lock()
+	defer p.reconcileStatusMu.Unlock()
+	p.reconcileStatus.LastRunAt = time.Now()
+	p.reconcileStatus.LastScanMs = scanMs
+	p.reconcileStatus.LastRepaired = repaired
+	p.reconcileStatus.TotalRuns++
 }
 
 // scanMissingMeta returns all non-internal keys that have no __meta: entry.
-// Phase 1: SCAN all masters to collect data keys.
+// Phase 1: SCAN all masters to collect data keys (respecting pattern filter).
 // Phase 2: Pipeline EXISTS checks in batches of 100 (100x fewer round trips
 // vs one EXISTS per key).
 func (p *Producer) scanMissingMeta(ctx context.Context) ([]string, error) {
@@ -344,7 +525,7 @@ func (p *Producer) scanMissingMeta(ctx context.Context) ([]string, error) {
 		allKeys []string
 	)
 
-	// Phase 1: SCAN each master for data keys (skipping internal keys).
+	// Phase 1: SCAN each master for data keys (skipping internal keys and filtered keys).
 	scanNode := func(scanCtx context.Context, c *redis.Client) error {
 		var cursor uint64
 		for {
@@ -354,10 +535,10 @@ func (p *Producer) scanMissingMeta(ctx context.Context) ([]string, error) {
 			}
 			var local []string
 			for _, key := range keys {
-				if strings.HasPrefix(key, "__repl:") ||
-					strings.HasPrefix(key, "__meta:") ||
-					strings.HasPrefix(key, "repl:stream:") ||
-					strings.HasPrefix(key, "repl:dlq:") {
+				if isInternalKey(key) {
+					continue
+				}
+				if !p.matchesFilter(key) {
 					continue
 				}
 				local = append(local, key)
@@ -479,14 +660,22 @@ func (p *Producer) handleEvent(ctx context.Context, msg *redis.Message, shadowAt
 	cmd := extractCommand(msg.Channel)
 
 	// Skip internal keys (meta, dedup shadow, replication streams, DLQ)
-	if strings.HasPrefix(key, "__repl:") || strings.HasPrefix(key, "__meta:") ||
-		strings.HasPrefix(key, "repl:stream:") || strings.HasPrefix(key, "repl:dlq:") {
+	if isInternalKey(key) {
 		return
 	}
 
 	// Skip untracked commands
 	if !trackedCommands[cmd] {
 		return
+	}
+
+	// Apply pattern filter (Feature 5). SyncKey bypasses this via shadowAtFire=0
+	// check below, but pattern filter still applies to PubSub events.
+	if len(p.includeGlobs) > 0 || len(p.excludeGlobs) > 0 {
+		if !p.matchesFilter(key) {
+			metrics.PatternFilteredTotal.WithLabelValues(p.siteID, "pattern").Inc()
+			return
+		}
 	}
 
 	// Read key value and TTL via dataClient (auto-routes to correct shard in cluster mode).
@@ -548,16 +737,24 @@ func (p *Producer) handleEvent(ctx context.Context, msg *redis.Message, shadowAt
 	seq := p.seqNo.Add(1)
 	seqID := fmt.Sprintf("%s-%d", p.siteID, seq)
 
+	// Compute absolute expiry epoch so the consumer can call PExpireAt directly
+	// without relying on clock synchronisation between sites (Feature 7).
+	var expiresAtMs int64
+	if ttlMs > 0 {
+		expiresAtMs = capturedAt + ttlMs
+	}
+
 	delta := bus.Delta{
-		SiteID:     p.siteID,
-		Key:        key,
-		KeyType:    keyType,
-		Value:      value,
-		HLC:        ts,
-		CapturedAt: capturedAt,
-		TTLMs:      ttlMs,
-		Cmd:        strings.ToUpper(cmd),
-		SeqID:      seqID,
+		SiteID:      p.siteID,
+		Key:         key,
+		KeyType:     keyType,
+		Value:       value,
+		HLC:         ts,
+		CapturedAt:  capturedAt,
+		TTLMs:       ttlMs,
+		ExpiresAtMs: expiresAtMs,
+		Cmd:         strings.ToUpper(cmd),
+		SeqID:       seqID,
 	}
 
 	// Write meta BEFORE publishing so the LWW anchor is visible to our own
@@ -594,4 +791,120 @@ func extractCommand(channel string) string {
 		return ""
 	}
 	return channel[idx+1:]
+}
+
+// isInternalKey returns true for RedisBridge-managed keys that must never be replicated.
+func isInternalKey(key string) bool {
+	return strings.HasPrefix(key, "__repl:") ||
+		strings.HasPrefix(key, "__meta:") ||
+		strings.HasPrefix(key, "repl:stream:") ||
+		strings.HasPrefix(key, "repl:dlq:")
+}
+
+// matchesFilter returns true if key should be replicated given the configured
+// include/exclude glob patterns. An empty includeGlobs list means all keys are
+// included. Exclude patterns take priority over include patterns.
+// Glob syntax: * matches any sequence, ? matches one character.
+// Note: path.Match treats / as a separator but Redis keys rarely contain /;
+// for keys with / use explicit patterns.
+func (p *Producer) matchesFilter(key string) bool {
+	// Step 1: include filter — key must match at least one include pattern
+	if len(p.includeGlobs) > 0 {
+		included := false
+		for _, pat := range p.includeGlobs {
+			if m, _ := path.Match(pat, key); m {
+				included = true
+				break
+			}
+		}
+		if !included {
+			return false
+		}
+	}
+	// Step 2: exclude filter — key must NOT match any exclude pattern
+	for _, pat := range p.excludeGlobs {
+		if m, _ := path.Match(pat, key); m {
+			return false
+		}
+	}
+	return true
+}
+
+// runBootstrap performs a full-scan publish of all data keys to the replication
+// stream. Used to seed a new site or recover after a prolonged outage.
+// Progress is tracked in prog; metrics are updated throughout.
+func (p *Producer) runBootstrap(ctx context.Context, prog *bootstrapProgress) {
+	defer func() {
+		prog.finishedAt = time.Now()
+		if ctx.Err() != nil {
+			prog.state = "cancelled"
+		} else if prog.errors.Load() > 0 {
+			prog.state = "done_with_errors"
+		} else {
+			prog.state = "done"
+		}
+		metrics.BootstrapInProgress.WithLabelValues(p.siteID).Set(0)
+		p.logger.Info("bootstrap: finished",
+			zap.String("state", prog.state),
+			zap.Int64("published", prog.published.Load()),
+			zap.Int64("errors", prog.errors.Load()),
+		)
+	}()
+
+	p.logger.Info("bootstrap: started",
+		zap.Strings("include", p.includeGlobs),
+		zap.Strings("exclude", p.excludeGlobs),
+	)
+
+	publishKey := func(key string) {
+		if ctx.Err() != nil {
+			return
+		}
+		p.handleEvent(ctx, &redis.Message{
+			Channel: "__keyevent@0__:set",
+			Payload: key,
+		}, 0, p.logger)
+		prog.published.Add(1)
+		metrics.BootstrapKeysPublishedTotal.WithLabelValues(p.siteID).Inc()
+	}
+
+	scanNode := func(scanCtx context.Context, c *redis.Client) error {
+		var cursor uint64
+		for {
+			if scanCtx.Err() != nil {
+				return nil
+			}
+			keys, next, err := c.Scan(scanCtx, cursor, "*", 500).Result()
+			if err != nil {
+				return err
+			}
+			for _, key := range keys {
+				if isInternalKey(key) {
+					continue
+				}
+				if !p.matchesFilter(key) {
+					continue
+				}
+				publishKey(key)
+			}
+			cursor = next
+			if cursor == 0 {
+				break
+			}
+		}
+		return nil
+	}
+
+	var scanErr error
+	if cc, ok := p.dataClient.(*redis.ClusterClient); ok {
+		scanErr = cc.ForEachMaster(ctx, scanNode)
+	} else if c, ok := p.dataClient.(*redis.Client); ok {
+		scanErr = scanNode(ctx, c)
+	}
+
+	if scanErr != nil {
+		prog.errors.Add(1)
+		prog.errMsg = scanErr.Error()
+		p.logger.Error("bootstrap: scan error", zap.Error(scanErr))
+	}
 }

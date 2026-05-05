@@ -540,6 +540,274 @@
       ],
       "title": "Total Consumer Group Lag (all streams)",
       "type": "stat"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 55},
+      "id": 50,
+      "title": "Reconciler — PubSub Gap Recovery",
+      "type": "row"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 56},
+      "id": 51,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [
+        {
+          "expr": "sum(repl_reconciler_runs_total) or vector(0)",
+          "legendFormat": "Total Runs",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "Reconciler Total Runs",
+      "type": "stat"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "orange", "value": 10}]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 56},
+      "id": 52,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [
+        {
+          "expr": "sum(repl_reconciler_repaired_total) or vector(0)",
+          "legendFormat": "Total Repaired",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "Reconciler Keys Repaired (PubSub drops recovered)",
+      "description": "Each increment = one key that PubSub dropped and the reconciler re-published.",
+      "type": "stat"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 10},
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 56},
+      "id": 53,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "expr": "rate(repl_reconciler_repaired_total[1m])",
+          "legendFormat": "repaired/s {{site_id}}",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(repl_reconciler_runs_total[1m])",
+          "legendFormat": "runs/s {{site_id}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Reconciler Activity (rate/s)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 10},
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 56},
+      "id": 54,
+      "options": {"legend": {"calcs": ["lastNotNull", "mean", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(repl_reconciler_scan_duration_ms_bucket[2m]))",
+          "legendFormat": "p50 {{site_id}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(repl_reconciler_scan_duration_ms_bucket[2m]))",
+          "legendFormat": "p95 {{site_id}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Reconciler Scan Duration p50/p95 (ms)",
+      "description": "Time to complete one full SCAN of all data keys across all masters.",
+      "type": "timeseries"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 64},
+      "id": 60,
+      "title": "Bootstrap Sync — New Site Seeding",
+      "type": "row"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 1}
+            ]
+          },
+          "mappings": [
+            {"options": {"0": {"text": "IDLE"}, "1": {"text": "RUNNING"}}, "type": "value"}
+          ],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 65},
+      "id": 61,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "center", "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value_and_name"},
+      "targets": [
+        {
+          "expr": "repl_bootstrap_in_progress",
+          "legendFormat": "{{site_id}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "Bootstrap In Progress",
+      "type": "stat"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 65},
+      "id": 62,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [
+        {
+          "expr": "sum(repl_bootstrap_keys_published_total) or vector(0)",
+          "legendFormat": "Total Bootstrap Keys",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "Bootstrap Keys Published (all-time)",
+      "type": "stat"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 10},
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 16, "x": 8, "y": 65},
+      "id": 63,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "expr": "rate(repl_bootstrap_keys_published_total[15s])",
+          "legendFormat": "bootstrap publish rate {{site_id}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Bootstrap Publish Rate (keys/s)",
+      "description": "Rate at which keys are published during an active bootstrap scan.",
+      "type": "timeseries"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 73},
+      "id": 70,
+      "title": "Pattern Filter & TTL Fidelity",
+      "type": "row"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 10},
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 74},
+      "id": 71,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "expr": "rate(repl_pattern_filtered_total[15s])",
+          "legendFormat": "filtered {{site_id}} [{{reason}}]",
+          "refId": "A"
+        }
+      ],
+      "title": "Pattern-Filtered Events (rate/s)",
+      "description": "Keyspace events skipped by include/exclude glob patterns. Zero if no patterns configured.",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 10},
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 74},
+      "id": 72,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "expr": "rate(repl_ttl_expired_in_transit_total[15s])",
+          "legendFormat": "expired-in-transit {{site_id}}",
+          "refId": "A"
+        }
+      ],
+      "title": "TTL Expired In-Transit (rate/s)",
+      "description": "Deltas skipped because the key's absolute expiry (ExpiresAtMs) had already passed when the consumer attempted to apply it.",
+      "type": "timeseries"
     }
 
   ],

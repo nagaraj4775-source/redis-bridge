@@ -53,7 +53,7 @@ func TestIntegrationWriteReplicates(t *testing.T) {
 	defer clientB.Close()
 
 	// Create bus
-	replBus := bus.NewRedisStreamsBus(busAddr, "", "repl:stream:", 1000000, logger)
+	replBus := bus.NewRedisStreamsBus(busAddr, "", "repl:stream:", 1000000, 0, logger)
 	defer replBus.Close()
 
 	// Setup agent A (producer)
@@ -66,7 +66,7 @@ func TestIntegrationWriteReplicates(t *testing.T) {
 	clockB := hlc.New()
 	ddB, _ := dedup.NewFilter(clientB, 5000, 100000)
 	appB := applier.New(clientB, ddB, logger)
-	consB := consumer.New("cluster-b", []string{"cluster-a"}, replBus, clientB, appB, ddB, clockB,
+	consB := consumer.New("cluster-b", "consumer-1", []string{"cluster-a"}, replBus, clientB, appB, ddB, clockB,
 		"repl-consumers", 100, 8, logger)
 
 	// Start producer A and consumer B
@@ -119,7 +119,7 @@ func TestIntegrationLWWConvergence(t *testing.T) {
 	defer clientA.Close()
 	defer clientB.Close()
 
-	replBus := bus.NewRedisStreamsBus(busAddr, "", "repl:stream:", 1000000, logger)
+	replBus := bus.NewRedisStreamsBus(busAddr, "", "repl:stream:", 1000000, 0, logger)
 	defer replBus.Close()
 
 	// Setup agents for both clusters
@@ -127,14 +127,14 @@ func TestIntegrationLWWConvergence(t *testing.T) {
 	ddA, _ := dedup.NewFilter(clientA, 5000, 100000)
 	prodA := producer.New("cluster-a", []*redis.Client{clientA}, clientA, replBus, clockA, ddA, logger)
 	appA := applier.New(clientA, ddA, logger)
-	consA := consumer.New("cluster-a", []string{"cluster-b"}, replBus, clientA, appA, ddA, clockA,
+	consA := consumer.New("cluster-a", "consumer-1", []string{"cluster-b"}, replBus, clientA, appA, ddA, clockA,
 		"repl-consumers", 100, 8, logger)
 
 	clockB := hlc.New()
 	ddB, _ := dedup.NewFilter(clientB, 5000, 100000)
 	prodB := producer.New("cluster-b", []*redis.Client{clientB}, clientB, replBus, clockB, ddB, logger)
 	appB := applier.New(clientB, ddB, logger)
-	consB := consumer.New("cluster-b", []string{"cluster-a"}, replBus, clientB, appB, ddB, clockB,
+	consB := consumer.New("cluster-b", "consumer-1", []string{"cluster-a"}, replBus, clientB, appB, ddB, clockB,
 		"repl-consumers", 100, 8, logger)
 
 	go prodA.Run(ctx)
@@ -179,7 +179,7 @@ func TestIntegrationHashReplication(t *testing.T) {
 	defer clientA.Close()
 	defer clientB.Close()
 
-	replBus := bus.NewRedisStreamsBus(busAddr, "", "repl:stream:", 1000000, logger)
+	replBus := bus.NewRedisStreamsBus(busAddr, "", "repl:stream:", 1000000, 0, logger)
 	defer replBus.Close()
 
 	clockA := hlc.New()
@@ -189,7 +189,7 @@ func TestIntegrationHashReplication(t *testing.T) {
 	clockB := hlc.New()
 	ddB, _ := dedup.NewFilter(clientB, 5000, 100000)
 	appB := applier.New(clientB, ddB, logger)
-	consB := consumer.New("cluster-b", []string{"cluster-a"}, replBus, clientB, appB, ddB, clockB,
+	consB := consumer.New("cluster-b", "consumer-1", []string{"cluster-a"}, replBus, clientB, appB, ddB, clockB,
 		"repl-consumers", 100, 8, logger)
 
 	go prodA.Run(ctx)

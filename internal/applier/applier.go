@@ -9,6 +9,7 @@ import (
 
 	"github.com/nagaraju/redibridge/internal/bus"
 	"github.com/nagaraju/redibridge/internal/dedup"
+	"github.com/nagaraju/redibridge/internal/metrics"
 	"github.com/nagaraju/redibridge/internal/reader"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
@@ -20,6 +21,7 @@ const metaPrefix = "__meta:"
 type Applier struct {
 	client redis.UniversalClient
 	dedup  *dedup.Filter
+	siteID string
 	logger *zap.Logger
 }
 
@@ -32,19 +34,40 @@ func New(client redis.UniversalClient, dedup *dedup.Filter, logger *zap.Logger) 
 	}
 }
 
+// WithSiteID sets the local site ID for metric labels.
+func (a *Applier) WithSiteID(siteID string) *Applier {
+	a.siteID = siteID
+	return a
+}
+
 // Apply writes an accepted delta to the local cluster.
 // It sets a dedup shadow key, applies the value via pipeline, preserves TTL,
 // and updates the __meta:{key} hash.
 func (a *Applier) Apply(ctx context.Context, delta bus.Delta) error {
-	// Check if key expired in transit
-	if delta.TTLMs > 0 {
+	// Check if key expired in transit.
+	// Use ExpiresAtMs (absolute epoch) if set; fall back to CapturedAt+TTLMs for
+	// backward-compatibility with older agents that don't send ExpiresAtMs.
+	if delta.ExpiresAtMs > 0 {
+		if time.Now().UnixMilli() >= delta.ExpiresAtMs {
+			a.logger.Debug("key expired in transit (ExpiresAtMs), skipping",
+				zap.String("key", delta.Key),
+				zap.Int64("expires_at_ms", delta.ExpiresAtMs))
+			if a.siteID != "" {
+				metrics.TTLExpiredInTransitTotal.WithLabelValues(a.siteID).Inc()
+			}
+			return nil
+		}
+	} else if delta.TTLMs > 0 {
 		elapsed := time.Now().UnixMilli() - delta.CapturedAt
 		remaining := delta.TTLMs - elapsed
 		if remaining <= 0 {
-			a.logger.Debug("key expired in transit, skipping",
+			a.logger.Debug("key expired in transit (TTLMs), skipping",
 				zap.String("key", delta.Key),
 				zap.Int64("ttl_ms", delta.TTLMs),
 				zap.Int64("elapsed", elapsed))
+			if a.siteID != "" {
+				metrics.TTLExpiredInTransitTotal.WithLabelValues(a.siteID).Inc()
+			}
 			return nil
 		}
 	}
@@ -145,11 +168,20 @@ func (a *Applier) Apply(ctx context.Context, delta bus.Delta) error {
 		return fmt.Errorf("unsupported key type: %s", delta.KeyType)
 	}
 
-	// Apply TTL if present and key type is not "none"
-	if delta.KeyType != "none" && delta.TTLMs > 0 {
-		expireAt := delta.CapturedAt + delta.TTLMs
-		if err := a.client.PExpireAt(ctx, delta.Key, time.UnixMilli(expireAt)).Err(); err != nil {
-			a.logger.Warn("PExpireAt failed", zap.String("key", delta.Key), zap.Error(err))
+	// Apply TTL using the absolute expiry epoch.
+	// ExpiresAtMs (set by producer as capturedAt+ttlMs) takes priority; fall back
+	// to the legacy CapturedAt+TTLMs calculation for older agent compatibility.
+	if delta.KeyType != "none" {
+		var expireAt int64
+		if delta.ExpiresAtMs > 0 {
+			expireAt = delta.ExpiresAtMs
+		} else if delta.TTLMs > 0 {
+			expireAt = delta.CapturedAt + delta.TTLMs
+		}
+		if expireAt > 0 {
+			if err := a.client.PExpireAt(ctx, delta.Key, time.UnixMilli(expireAt)).Err(); err != nil {
+				a.logger.Warn("PExpireAt failed", zap.String("key", delta.Key), zap.Error(err))
+			}
 		}
 	}
 

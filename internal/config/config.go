@@ -69,11 +69,13 @@ type BusConfig struct {
 }
 
 type ReplicationConfig struct {
-	BatchSize                int `mapstructure:"batch_size"`
-	ApplyConcurrency         int `mapstructure:"apply_concurrency"`
-	DedupTTLSeconds          int `mapstructure:"dedup_ttl_seconds"`
-	MaxInFlight              int `mapstructure:"max_in_flight"`
-	ReconcileIntervalSeconds int `mapstructure:"reconcile_interval_seconds"` // 0 = disabled
+	BatchSize                int      `mapstructure:"batch_size"`
+	ApplyConcurrency         int      `mapstructure:"apply_concurrency"`
+	DedupTTLSeconds          int      `mapstructure:"dedup_ttl_seconds"`
+	MaxInFlight              int      `mapstructure:"max_in_flight"`
+	ReconcileIntervalSeconds int      `mapstructure:"reconcile_interval_seconds"` // 0 = disabled
+	IncludePatterns          []string `mapstructure:"include_patterns"`            // if non-empty, only replicate keys matching at least one pattern
+	ExcludePatterns          []string `mapstructure:"exclude_patterns"`            // never replicate keys matching any of these patterns
 }
 
 type CoordinatorConfig struct {

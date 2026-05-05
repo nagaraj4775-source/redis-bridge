@@ -250,7 +250,7 @@ If both are `0`, the stream grows indefinitely.
 | **HLC Clock** | `internal/clock/` | Provides monotonic, distributed-safe timestamps |
 | **Bus** | `internal/bus/` | Abstraction over Redis Streams (standalone / sentinel / cluster) |
 | **Config** | `internal/config/config.go` | YAML config loader with validation |
-| **Coordinator** | `internal/coordinator/` | HTTP API: `/health`, `/lag`, `/stats`, `/config`, `/pause`, `/resume` |
+| **Coordinator** | `internal/coordinator/` | HTTP API: `/health`, `/lag`, `/stats`, `/config`, `/pause`, `/resume`, `/reconcile`, `/sync`, `/key-status`, `/bootstrap` |
 
 ---
 
@@ -412,6 +412,208 @@ replication:
 
 ---
 
+## Management HTTP API
+
+Every agent exposes an HTTP management API on `coordinator.port` (default `8080`).
+
+### Existing endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Liveness check — returns `{"status":"ok"}` |
+| `GET` | `/lag` | Per-peer replication lag in milliseconds |
+| `GET` | `/stats` | Consumer group lag, pending counts, stream lengths |
+| `GET` | `/config` | Redacted view of the running config |
+| `POST` | `/pause` | Pause all consumers on this agent |
+| `POST` | `/resume` | Resume all consumers |
+
+### On-Demand Reconcile (Feature 1)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/reconcile` | Trigger an immediate reconciler cycle (no wait for next tick) |
+| `GET` | `/reconcile/status` | Last cycle stats: scan duration, keys repaired, total runs |
+| `POST` | `/sync?key=<name>` | Force-publish one specific key, bypassing dedup |
+
+**Example — trigger reconcile:**
+```bash
+curl -X POST http://localhost:8080/reconcile
+# {"message":"reconciler cycle triggered","queued":true,"status":"ok"}
+```
+
+**Example — check reconcile status:**
+```bash
+curl http://localhost:8080/reconcile/status
+# {
+#   "enabled": true,
+#   "last_run_at": "2024-11-01T12:34:56Z",
+#   "last_scan_ms": 312,
+#   "last_repaired": 2,
+#   "total_runs": 47
+# }
+```
+
+**Example — force-publish a single key:**
+```bash
+curl -X POST "http://localhost:8080/sync?key=users:42"
+# {"key":"users:42","message":"force-published to replication stream","status":"ok"}
+```
+
+### Per-Key Replication Status (Feature 3)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/key-status?key=<name>` | Whether a key has been published and from which site |
+
+The endpoint reads the `__meta:{key}` hash that the producer writes on every successful publish. If the hash is absent the key has never been replicated from this site.
+
+```bash
+curl "http://localhost:8080/key-status?key=users:42"
+# {"key":"users:42","published":true,"hlc":1732100000123456,"origin_site":"ec-site-a"}
+
+curl "http://localhost:8080/key-status?key=missing:key"
+# {"key":"missing:key","published":false,"hlc":0,"origin_site":""}
+```
+
+### Bootstrap Sync (Feature 6)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/bootstrap` | Start a one-time full-scan publish of all data keys |
+| `POST` | `/bootstrap?stop=1` | Cancel a running bootstrap |
+| `GET` | `/bootstrap/status` | Live progress: state, keys published, errors |
+
+Bootstrap is the answer to *"I just added a new site — how do I seed it with existing data?"*. It performs a cursor-based SCAN across all masters and publishes every matching key to the replication stream. Peer sites consume those events and apply via the normal LWW path, so existing newer local writes are never overwritten.
+
+```bash
+# 1. Start bootstrap on the source site
+curl -X POST http://localhost:8080/bootstrap
+# {"message":"bootstrap started — poll /bootstrap/status for progress","status":"ok"}
+
+# 2. Poll progress
+curl http://localhost:8080/bootstrap/status
+# {"state":"running","started_at":"...","published":48213,"errors":0}
+
+# Wait until state == "done" or "done_with_errors"
+curl http://localhost:8080/bootstrap/status
+# {"state":"done","published":100000,"errors":0}
+
+# 3. Cancel if needed
+curl -X POST "http://localhost:8080/bootstrap?stop=1"
+```
+
+**Bootstrap respects pattern filters** — if `include_patterns` / `exclude_patterns` are configured, only matching keys are published.
+
+---
+
+## Key Pattern Filtering (Feature 5)
+
+By default, RedisBridge replicates **all** user keys. You can restrict replication to specific key patterns using glob-style include/exclude rules in `agent.yaml`.
+
+```yaml
+replication:
+  include_patterns:       # if set, only keys matching at least one pattern are replicated
+    - "users:*"
+    - "orders:*"
+    - "inventory:*"
+  exclude_patterns:       # keys matching any pattern are NEVER replicated
+    - "cache:*"
+    - "tmp:*"
+    - "session:*"
+```
+
+### Evaluation Order
+
+```
+1. Is the key an internal RedisBridge key (__meta:, repl:stream:, …)?  → always skip
+2. include_patterns defined AND key does NOT match any → skip + increment metric
+3. key matches any exclude_pattern                    → skip + increment metric
+4. Otherwise                                          → replicate normally
+```
+
+### Glob Syntax
+
+Patterns use standard Go `path.Match` glob syntax:
+
+| Pattern | Matches | Does NOT match |
+|---------|---------|----------------|
+| `users:*` | `users:123`, `users:abc:profile` | `orders:123` |
+| `orders:?` | `orders:1` | `orders:123` |
+| `cache:[abc]:*` | `cache:a:foo`, `cache:b:bar` | `cache:d:foo` |
+
+> **Note:** `*` matches any sequence of characters except `/`. Since Redis keys rarely contain `/`, this works as a general wildcard for `:` separated namespaces.
+
+### Scope
+
+Pattern filtering applies to:
+- **PubSub events** — the hot path; filtered before any Redis read
+- **Reconciler scans** — filtered during the SCAN phase so non-matching keys are never checked or re-published
+- **Bootstrap syncs** — filtered during SCAN so only matching keys are seeded
+
+### Observability
+
+Filtered events increment the `repl_pattern_filtered_total{site_id, reason}` Prometheus counter. A steady rate here is normal when patterns are configured; a sudden spike on a previously unconfigured agent indicates a misconfiguration.
+
+---
+
+## TTL Fidelity (Feature 7)
+
+### The Problem
+
+When a key has a TTL (time-to-live), naively replicating the *remaining* TTL causes all peer sites to expire the key *later* than the origin:
+
+```
+t=0   Site-A writes:  SET session:42 EX 60   (expires at t=60)
+t=5   Producer reads remaining TTL: 55s
+t=5   Delta published: {key: session:42, ttl_ms: 55000}
+t=6   Site-B consumer applies delta, sets TTL to 55s from NOW
+      → Site-B expires session:42 at t=61   ← 1 second late!
+      (worse if replication is lagged by 10s: expires at t=70)
+```
+
+With high lag or network jitter, sessions could outlive their intended expiry by seconds to minutes across sites.
+
+### The Fix: Absolute Expiry Epoch
+
+The producer computes the **absolute expiry epoch** at capture time and encodes it in the delta:
+
+```
+expiresAtMs = capturedAt + remainingTTLms
+```
+
+The consumer then calls `PEXPIREAT key expiresAtMs` — which sets the **same wall-clock expiry** on every site regardless of replication lag.
+
+```
+t=0   Site-A writes:  SET session:42 EX 60
+t=5   Producer captures:  capturedAt=T+5, ttlMs=55000
+                         expiresAtMs = T+5 + 55000 = T+60s  ← absolute epoch
+t=5   Delta: {key: session:42, expires_at_ms: <T+60s>}
+t=6   Site-B: PEXPIREAT session:42 <T+60s>  → expires at T+60s ✓
+t=15  Site-C: PEXPIREAT session:42 <T+60s>  → expires at T+60s ✓
+```
+
+All sites expire the key at the same wall-clock instant, regardless of how long the delta spent in the stream.
+
+### In-Transit Expiry Guard
+
+If the key's TTL expires **while the delta is still in the stream** (e.g., very long lag + very short TTL), the consumer skips the apply entirely:
+
+```
+if now >= expiresAtMs → skip (key is already logically expired)
+```
+
+This prevents writing a key to the peer site only to have it immediately expire — a waste of a write and potentially confusing to applications.
+
+### Wire Format
+
+The `ExpiresAtMs` field is backward-compatible. Older agents that do not send it fall back to the legacy `CapturedAt + TTLMs` calculation in the applier. Both approaches produce the same result when clocks are synchronized.
+
+### Observability
+
+Keys skipped due to in-transit expiry increment `repl_ttl_expired_in_transit_total{site_id}`. A non-zero rate is normal for workloads with very short TTLs (< 1 s) under high lag conditions.
+
+---
+
 ## Frequently Asked Questions
 
 **Q: What if Site-B is down for an hour while Site-A writes 10,000 keys?**  
@@ -421,10 +623,57 @@ A: All 10,000 deltas accumulate in `repl:stream:ec-site-a`. When Site-B's agent 
 A: Both deltas are published to both streams. Every site picks the delta with the **higher HLC timestamp** and discards the other. All sites converge to the same value.
 
 **Q: Does this work with existing Redis data already in the cluster?**  
-A: Only **new writes** (after the agent starts) are replicated. Keys written before the agent started will not be retroactively synced unless you trigger a write on each existing key.
+A: Only **new writes** (after the agent starts) are replicated by default. Use `POST /bootstrap` to publish all existing keys to the replication stream so peer sites can catch up.
 
 **Q: Is there any message broker required (Kafka, RabbitMQ, etc.)?**  
 A: No. RedisBridge uses Redis Streams built into your existing Redis instances. In embedded bus mode, no additional infrastructure is needed at all.
 
 **Q: What Redis data types are supported?**  
 A: `string`, `hash`, `list`, `set`, and `zset`. `del` (deletion) is also replicated.
+
+**Q: I just added a fourth site. How do I seed it with existing data?**  
+A: Start the new agent normally (it will receive all new writes automatically). Then trigger a bootstrap on each existing source site:
+```bash
+curl -X POST http://site-a-agent:8080/bootstrap
+curl -X POST http://site-b-agent:8080/bootstrap
+curl -X POST http://site-c-agent:8080/bootstrap
+```
+Poll `GET /bootstrap/status` until `state == "done"`. The new site's consumer will apply all published deltas via LWW — no duplicate-write issues because LWW discards anything older than what the site already has.
+
+**Q: I suspect a specific key is missing from Site-B. How do I confirm and fix it?**  
+A:
+```bash
+# Check whether the key was ever published from Site-A
+curl "http://site-a-agent:8080/key-status?key=mykey"
+# {"published":false,...}  ← never published, confirming the gap
+
+# Force-publish it immediately
+curl -X POST "http://site-a-agent:8080/sync?key=mykey"
+```
+
+**Q: How do I trigger a reconcile without waiting for the next 30-second tick?**  
+A:
+```bash
+curl -X POST http://localhost:8080/reconcile
+# Check what it found/fixed
+curl http://localhost:8080/reconcile/status
+```
+
+**Q: Can I replicate only certain namespaces (e.g., skip cache keys)?**  
+A: Yes. Add pattern filters to `agent.yaml`:
+```yaml
+replication:
+  exclude_patterns:
+    - "cache:*"
+    - "tmp:*"
+```
+Or to replicate only specific namespaces:
+```yaml
+replication:
+  include_patterns:
+    - "users:*"
+    - "orders:*"
+```
+
+**Q: Will TTL-limited keys (sessions, tokens) expire at the same time on all sites?**  
+A: Yes, after Feature 7. The producer encodes an absolute expiry epoch (`expiresAtMs = capturedAt + ttlMs`) in every delta. The consumer calls `PEXPIREAT` with that epoch, so every site expires the key at the same wall-clock instant regardless of replication lag.

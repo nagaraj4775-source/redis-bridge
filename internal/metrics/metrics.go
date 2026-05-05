@@ -77,4 +77,44 @@ var (
 		Help:    "Duration of apply operations in milliseconds",
 		Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 25, 50, 100, 250},
 	}, []string{"site_id", "peer_site"})
+
+	// Reconciler metrics
+	ReconcilerRunsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "repl_reconciler_runs_total",
+		Help: "Total number of reconciler cycles completed",
+	}, []string{"site_id"})
+
+	ReconcilerRepairedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "repl_reconciler_repaired_total",
+		Help: "Total number of keys re-published by the reconciler (PubSub drops recovered)",
+	}, []string{"site_id"})
+
+	ReconcilerScanDurationMs = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "repl_reconciler_scan_duration_ms",
+		Help:    "Duration of each reconciler full-scan cycle in milliseconds",
+		Buckets: []float64{50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000},
+	}, []string{"site_id"})
+
+	// Bootstrap metrics
+	BootstrapInProgress = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "repl_bootstrap_in_progress",
+		Help: "1 if a bootstrap scan is currently running, 0 otherwise",
+	}, []string{"site_id"})
+
+	BootstrapKeysPublishedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "repl_bootstrap_keys_published_total",
+		Help: "Total keys published during bootstrap syncs",
+	}, []string{"site_id"})
+
+	// Pattern filter metrics
+	PatternFilteredTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "repl_pattern_filtered_total",
+		Help: "Total keyspace events skipped by include/exclude pattern filters",
+	}, []string{"site_id", "reason"})
+
+	// TTL metrics
+	TTLExpiredInTransitTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "repl_ttl_expired_in_transit_total",
+		Help: "Total deltas skipped because the key TTL expired before the consumer applied it",
+	}, []string{"site_id"})
 )

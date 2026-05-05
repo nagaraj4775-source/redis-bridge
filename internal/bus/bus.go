@@ -14,15 +14,16 @@ import (
 
 // Delta is the replication event transmitted over the bus.
 type Delta struct {
-	SiteID     string `json:"site_id"`
-	Key        string `json:"key"`
-	KeyType    string `json:"key_type"`
-	Value      []byte `json:"value"`
-	HLC        uint64 `json:"hlc"`
-	CapturedAt int64  `json:"captured_at"`
-	TTLMs      int64  `json:"ttl_ms"`
-	Cmd        string `json:"cmd"`
-	SeqID      string `json:"seq_id"`
+	SiteID      string `json:"site_id"`
+	Key         string `json:"key"`
+	KeyType     string `json:"key_type"`
+	Value       []byte `json:"value"`
+	HLC         uint64 `json:"hlc"`
+	CapturedAt  int64  `json:"captured_at"`
+	TTLMs       int64  `json:"ttl_ms"`
+	ExpiresAtMs int64  `json:"expires_at_ms"` // absolute expiry epoch ms (0 = no expiry); supersedes CapturedAt+TTLMs
+	Cmd         string `json:"cmd"`
+	SeqID       string `json:"seq_id"`
 }
 
 // LagInfo captures consumer-group lag for one peer stream.

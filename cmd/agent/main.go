@@ -113,11 +113,12 @@ func main() {
 	}
 
 	// Create applier
-	app := applier.New(localClient, dd, logger)
+	app := applier.New(localClient, dd, logger).WithSiteID(cfg.SiteID)
 
 	// Create producer
 	prod := producer.New(cfg.SiteID, masters, localClient, replBus, clock, dd, logger).
-		WithReconcileInterval(time.Duration(cfg.Replication.ReconcileIntervalSeconds) * time.Second)
+		WithReconcileInterval(time.Duration(cfg.Replication.ReconcileIntervalSeconds) * time.Second).
+		WithPatternFilter(cfg.Replication.IncludePatterns, cfg.Replication.ExcludePatterns)
 
 	// In cluster mode, enable automatic re-subscription when a replica is
 	// promoted to master. The producer polls CLUSTER topology every 10 s and
@@ -151,8 +152,12 @@ func main() {
 		logger,
 	)
 
-	// Create coordinator
-	coord := coordinator.New(cfg, cons, logger)
+	// Create coordinator (prod may be nil in consumer-only role; coordinator handles nil gracefully)
+	var coordProd *producer.Producer
+	if cfg.Role != "consumer" {
+		coordProd = prod
+	}
+	coord := coordinator.New(cfg, cons, coordProd, logger)
 
 	// Start all components
 	var wg sync.WaitGroup
