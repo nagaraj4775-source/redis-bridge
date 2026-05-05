@@ -55,16 +55,17 @@ var trackedCommands = map[string]bool{
 
 // Producer listens for keyspace events on Redis masters and publishes deltas.
 type Producer struct {
-	siteID        string
-	masters       []*redis.Client      // per-node clients for PSubscribe only
-	clusterClient *redis.ClusterClient // non-nil in cluster mode; used for topology watch
-	nodeOpts      *redis.Options       // base opts for creating dynamic per-node clients
-	dataClient    redis.UniversalClient
-	bus           bus.Bus
-	clock         *hlc.HLC
-	dedup         *dedup.Filter
-	logger        *zap.Logger
-	seqNo         atomic.Uint64
+	siteID            string
+	masters           []*redis.Client      // per-node clients for PSubscribe only
+	clusterClient     *redis.ClusterClient // non-nil in cluster mode; used for topology watch
+	nodeOpts          *redis.Options       // base opts for creating dynamic per-node clients
+	dataClient        redis.UniversalClient
+	bus               bus.Bus
+	clock             *hlc.HLC
+	dedup             *dedup.Filter
+	logger            *zap.Logger
+	seqNo             atomic.Uint64
+	reconcileInterval time.Duration // 0 = disabled
 
 	subMu  sync.Mutex
 	subSet map[string]context.CancelFunc // master addr → cancel func
@@ -76,15 +77,23 @@ type Producer struct {
 // dataClient is used for all data operations and can be a ClusterClient for automatic routing.
 func New(siteID string, masters []*redis.Client, dataClient redis.UniversalClient, b bus.Bus, clock *hlc.HLC, dd *dedup.Filter, logger *zap.Logger) *Producer {
 	return &Producer{
-		siteID:     siteID,
-		masters:    masters,
-		dataClient: dataClient,
-		bus:        b,
-		clock:      clock,
-		dedup:      dd,
-		logger:     logger,
-		subSet:     make(map[string]context.CancelFunc),
+		siteID:            siteID,
+		masters:           masters,
+		dataClient:        dataClient,
+		bus:               b,
+		clock:             clock,
+		dedup:             dd,
+		logger:            logger,
+		subSet:            make(map[string]context.CancelFunc),
+		reconcileInterval: 30 * time.Second, // default; override with WithReconcileInterval
 	}
+}
+
+// WithReconcileInterval sets how often the reconciler scans for PubSub-missed keys.
+// Set to 0 to disable the reconciler entirely.
+func (p *Producer) WithReconcileInterval(d time.Duration) *Producer {
+	p.reconcileInterval = d
+	return p
 }
 
 // WithClusterTopologyWatch enables automatic re-subscription when a replica is
@@ -138,6 +147,14 @@ func (p *Producer) Run(ctx context.Context) error {
 		}()
 	}
 
+	// Reconciler catches keys whose PubSub event was silently dropped.
+	// PubSub is at-most-once; the reconciler is the reliability safety net.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		p.runReconciler(ctx)
+	}()
+
 	wg.Wait()
 	return nil
 }
@@ -175,6 +192,24 @@ func (p *Producer) reconcileMasters(ctx context.Context) {
 	}); err != nil {
 		p.logger.Warn("topology reconcile: ForEachMaster failed", zap.Error(err))
 		return
+	}
+
+	// Log address sets so we can detect hostname vs IP format mismatches.
+	{
+		cur := make([]string, 0, len(currentAddrs))
+		for a := range currentAddrs {
+			cur = append(cur, a)
+		}
+		p.subMu.Lock()
+		sub := make([]string, 0, len(p.subSet))
+		for a := range p.subSet {
+			sub = append(sub, a)
+		}
+		p.subMu.Unlock()
+		p.logger.Info("topology reconcile",
+			zap.Strings("cluster_masters", cur),
+			zap.Strings("active_subscriptions", sub),
+		)
 	}
 
 	p.subMu.Lock()
@@ -228,6 +263,160 @@ func (p *Producer) reconcileMasters(ctx context.Context) {
 	}
 }
 
+// runReconciler periodically scans all data keys and re-publishes any that
+// were never captured by PubSub (at-most-once delivery gap). The scan interval
+// is configured via WithReconcileInterval (default 30 s; 0 = disabled).
+// Each cycle waits a settle delay (1/3 of the interval, min 5 s, max 15 s)
+// before re-checking candidates, allowing in-flight PubSub events to finish.
+func (p *Producer) runReconciler(ctx context.Context) {
+	if p.reconcileInterval <= 0 {
+		p.logger.Info("reconciler: disabled (reconcile_interval_seconds=0)")
+		return
+	}
+	settleDelay := p.reconcileInterval / 3
+	if settleDelay < 5*time.Second {
+		settleDelay = 5 * time.Second
+	}
+	if settleDelay > 15*time.Second {
+		settleDelay = 15 * time.Second
+	}
+	p.logger.Info("reconciler: started",
+		zap.Duration("interval", p.reconcileInterval),
+		zap.Duration("settle", settleDelay))
+	ticker := time.NewTicker(p.reconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.reconcileMissedEvents(ctx, settleDelay)
+		}
+	}
+}
+
+func (p *Producer) reconcileMissedEvents(ctx context.Context, settleDelay time.Duration) {
+	candidates, err := p.scanMissingMeta(ctx)
+	if err != nil {
+		p.logger.Warn("reconciler: scan failed", zap.Error(err))
+		return
+	}
+	if len(candidates) == 0 {
+		return
+	}
+	p.logger.Info("reconciler: keys without meta (settling)",
+		zap.Int("count", len(candidates)), zap.Duration("settle", settleDelay))
+
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(settleDelay):
+	}
+
+	republished := 0
+	for _, key := range candidates {
+		if ctx.Err() != nil {
+			return
+		}
+		exists, err := p.dataClient.Exists(ctx, "__meta:"+key).Result()
+		if err != nil || exists > 0 {
+			continue // PubSub caught up during settle window
+		}
+		p.logger.Info("reconciler: re-publishing missed event", zap.String("key", key))
+		p.handleEvent(ctx, &redis.Message{
+			Channel: "__keyevent@0__:set",
+			Payload: key,
+		}, 0, p.logger)
+		republished++
+	}
+	if republished > 0 {
+		p.logger.Info("reconciler: done", zap.Int("republished", republished))
+	}
+}
+
+// scanMissingMeta returns all non-internal keys that have no __meta: entry.
+// Phase 1: SCAN all masters to collect data keys.
+// Phase 2: Pipeline EXISTS checks in batches of 100 (100x fewer round trips
+// vs one EXISTS per key).
+func (p *Producer) scanMissingMeta(ctx context.Context) ([]string, error) {
+	var (
+		mu      sync.Mutex
+		allKeys []string
+	)
+
+	// Phase 1: SCAN each master for data keys (skipping internal keys).
+	scanNode := func(scanCtx context.Context, c *redis.Client) error {
+		var cursor uint64
+		for {
+			keys, next, err := c.Scan(scanCtx, cursor, "*", 500).Result()
+			if err != nil {
+				return err
+			}
+			var local []string
+			for _, key := range keys {
+				if strings.HasPrefix(key, "__repl:") ||
+					strings.HasPrefix(key, "__meta:") ||
+					strings.HasPrefix(key, "repl:stream:") ||
+					strings.HasPrefix(key, "repl:dlq:") {
+					continue
+				}
+				local = append(local, key)
+			}
+			if len(local) > 0 {
+				mu.Lock()
+				allKeys = append(allKeys, local...)
+				mu.Unlock()
+			}
+			cursor = next
+			if cursor == 0 {
+				break
+			}
+		}
+		return nil
+	}
+
+	if cc, ok := p.dataClient.(*redis.ClusterClient); ok {
+		if err := cc.ForEachMaster(ctx, scanNode); err != nil {
+			return nil, fmt.Errorf("reconciler ForEachMaster: %w", err)
+		}
+	} else if c, ok := p.dataClient.(*redis.Client); ok {
+		if err := scanNode(ctx, c); err != nil {
+			return nil, err
+		}
+	}
+
+	if len(allKeys) == 0 {
+		return nil, nil
+	}
+
+	// Phase 2: pipeline EXISTS __meta:{key} in batches of 100.
+	// This reduces N round trips to N/100 round trips.
+	const pipelineBatch = 100
+	var missing []string
+	for i := 0; i < len(allKeys); i += pipelineBatch {
+		end := i + pipelineBatch
+		if end > len(allKeys) {
+			end = len(allKeys)
+		}
+		batch := allKeys[i:end]
+
+		pipe := p.dataClient.Pipeline()
+		cmds := make([]*redis.IntCmd, len(batch))
+		for j, key := range batch {
+			cmds[j] = pipe.Exists(ctx, "__meta:"+key)
+		}
+		if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+			return nil, fmt.Errorf("reconciler pipeline EXISTS: %w", err)
+		}
+		for j, cmd := range cmds {
+			if cmd.Val() == 0 {
+				missing = append(missing, batch[j])
+			}
+		}
+	}
+	return missing, nil
+}
+
 func (p *Producer) listenMaster(ctx context.Context, idx int, client *redis.Client) {
 	var logger *zap.Logger
 	if idx >= 0 {
@@ -260,7 +449,7 @@ func (p *Producer) subscribeAndProcess(ctx context.Context, idx int, client *red
 	// Semaphore limits concurrent event handlers so events are dispatched
 	// immediately (not queued behind serial processing). This keeps the
 	// shadow-key TTL check valid even during 100k-key bulk operations.
-	const workerConcurrency = 50
+	const workerConcurrency = 200
 	sem := make(chan struct{}, workerConcurrency)
 
 	for {
@@ -271,16 +460,19 @@ func (p *Producer) subscribeAndProcess(ctx context.Context, idx int, client *red
 			if !ok {
 				return fmt.Errorf("pubsub channel closed")
 			}
-			sem <- struct{}{}
 			go func(m *redis.Message) {
+				// Capture the applying-shadow BEFORE entering the semaphore queue.
+				shadowAtFire, _ := p.dedup.ApplyingHash(ctx, m.Payload)
+
+				sem <- struct{}{}
 				defer func() { <-sem }()
-				p.handleEvent(ctx, m, logger)
+				p.handleEvent(ctx, m, shadowAtFire, logger)
 			}(msg)
 		}
 	}
 }
 
-func (p *Producer) handleEvent(ctx context.Context, msg *redis.Message, logger *zap.Logger) {
+func (p *Producer) handleEvent(ctx context.Context, msg *redis.Message, shadowAtFire uint32, logger *zap.Logger) {
 	// msg.Channel: __keyevent@0__:set
 	// msg.Payload: the key name
 	key := msg.Payload
@@ -300,27 +492,39 @@ func (p *Producer) handleEvent(ctx context.Context, msg *redis.Message, logger *
 	// Read key value and TTL via dataClient (auto-routes to correct shard in cluster mode).
 	keyType, value, err := reader.ReadValue(ctx, p.dataClient, key)
 	if err != nil {
-		// Key might have been deleted between notification and read
 		if cmd == "del" {
 			keyType = "none"
 			value = nil
 		} else {
-			logger.Debug("failed to read key value", zap.String("key", key), zap.Error(err))
-			return
+			// Retry with exponential backoff — pool exhaustion at burst rates
+			// can cause transient failures that resolve within a few ms.
+			const maxAttempts = 5
+			var retryErr error
+			for attempt := 1; attempt < maxAttempts; attempt++ {
+				time.Sleep(time.Duration(10*(1<<(attempt-1))) * time.Millisecond) // 10, 20, 40, 80 ms
+				keyType, value, retryErr = reader.ReadValue(ctx, p.dataClient, key)
+				if retryErr == nil {
+					break
+				}
+			}
+			if retryErr != nil {
+				logger.Warn("failed to read key value after retries, dropping",
+					zap.String("key", key), zap.Int("attempts", maxAttempts), zap.Error(retryErr))
+				return
+			}
 		}
 	}
 
-	// Value-hash loop prevention: the shadow stores a CRC32 of the value the
-	// consumer just applied. If the current key value matches that hash, this
-	// keyspace event was triggered by the Apply's SET → skip (prevents infinite
-	// replication loops). If the hash differs, a new user write overwrote the
-	// applied value → publish so all sites learn about it.
-	shadowHash, err := p.dedup.ApplyingHash(ctx, key)
-	if err != nil {
-		logger.Warn("dedup check failed", zap.String("key", key), zap.Error(err))
-		return
-	}
-	if shadowHash > 0 && dedup.ValueHash(value) == shadowHash {
+	// Value-hash loop prevention: use the shadow snapshot taken at event-fire
+	// time (before any semaphore delay) to distinguish Apply-triggered events
+	// (shadow set BEFORE the triggering SET) from original user writes (no shadow).
+	if shadowAtFire > 0 && dedup.ValueHash(value) == shadowAtFire {
+		logger.Warn("shadow-dedup drop",
+			zap.String("key", key),
+			zap.String("cmd", cmd),
+			zap.Uint32("shadowAtFire", shadowAtFire),
+			zap.Uint32("valueHash", dedup.ValueHash(value)),
+		)
 		return
 	}
 
@@ -368,11 +572,14 @@ func (p *Producer) handleEvent(ctx context.Context, msg *redis.Message, logger *
 		}
 	}
 
-	// Publish to bus
+	// Publish to bus — retry once on transient failure.
 	if err := p.bus.Publish(ctx, p.siteID, delta); err != nil {
-		logger.Error("failed to publish delta",
-			zap.String("key", key), zap.Error(err))
-		return
+		time.Sleep(100 * time.Millisecond)
+		if err2 := p.bus.Publish(ctx, p.siteID, delta); err2 != nil {
+			logger.Error("failed to publish delta after retry",
+				zap.String("key", key), zap.Error(err2))
+			return
+		}
 	}
 
 	metrics.EventsCaptured.WithLabelValues(p.siteID, keyType).Inc()

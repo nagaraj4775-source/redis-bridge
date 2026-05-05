@@ -136,7 +136,7 @@ func (b *RedisStreamsBus) streamName(siteID string) string {
 // Publish writes a delta to the site's replication stream.
 // Trimming strategy (applied on every XADD):
 //   - streamTTL > 0 → MINID: trim entries whose ID (ms timestamp) is older than now-TTL.
-//   - maxLen > 0    → MAXLEN ~: keep at most maxLen entries (count-based, approximate).
+//   - maxLen > 0    → MAXLEN: keep at most maxLen entries exactly (count-based).
 //   - neither set   → no trimming (unlimited growth).
 func (b *RedisStreamsBus) Publish(ctx context.Context, siteID string, delta Delta) error {
 	valBytes, err := json.Marshal(delta)
@@ -146,7 +146,7 @@ func (b *RedisStreamsBus) Publish(ctx context.Context, siteID string, delta Delt
 
 	args := &redis.XAddArgs{
 		Stream: b.streamName(siteID),
-		Approx: true,
+		Approx: false, // exact MAXLEN: never trim entries the consumer hasn't read yet
 		Values: map[string]interface{}{
 			"data": string(valBytes),
 		},

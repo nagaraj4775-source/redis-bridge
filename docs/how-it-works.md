@@ -326,6 +326,92 @@ Each agent is configured via a YAML file (e.g. `config/cluster/embedded-bus/agen
 
 ---
 
+## Reconciler — Safety Net for Missed PubSub Events
+
+### The Problem: PubSub Is At-Most-Once
+
+The producer detects key changes via Redis keyspace notifications (PubSub). This mechanism is **at-most-once** — Redis fires the event and immediately forgets it. There is no acknowledgment, no retry, no persistence.
+
+When the go-redis PubSub connection performs its periodic health check (~every 100ms), it briefly disconnects and reconnects. Any keyspace events fired during this reconnect window (typically 1–10ms) are **permanently lost** — the producer never sees them, they are never published to the stream, and the key is never replicated.
+
+```
+t=0ms   PubSub connected and subscribed
+t=100ms Health check → reconnecting...
+t=101ms SET mykey fired → keyspace event emitted ← NOBODY LISTENING
+t=102ms PubSub reconnected and re-subscribed
+t=103ms SET otherkey fired → delivered normally ✓
+```
+
+`mykey` is silently dropped with no error, no log, no metric anywhere in the stack.
+
+### How the Reconciler Fixes This
+
+The reconciler is a background goroutine inside the producer that acts as a **periodic safety net**. It exploits the structural invariant that every successfully published key has a `__meta:{key}` hash written to Redis. A key without this anchor was never published.
+
+**Each reconciler cycle:**
+
+```
+1. SCAN all data keys across all masters (ForEachMaster in cluster mode)
+2. Collect candidates: keys with no __meta: entry
+3. Wait settle delay (let any still in-flight PubSub events be processed)
+4. Re-check each candidate:
+   - __meta: now exists → PubSub caught up naturally → skip
+   - __meta: still missing → confirmed PubSub drop → re-publish
+5. Re-publish: synthesize a SET event and call handleEvent directly
+   → reads current value, stamps with fresh HLC, publishes delta to stream
+```
+
+The consumer's **LWW + SeqID dedup** ensures re-published events are idempotent — even if a key is re-published multiple times, site-b applies it correctly without duplication.
+
+### Performance Design
+
+The reconciler is designed to add minimal overhead:
+
+| Concern | Solution |
+|---------|----------|
+| N EXISTS round trips per scan | **Pipelined in batches of 100** → 100× fewer round trips |
+| Scanning large key spaces | SCAN uses cursor-based iteration — non-blocking, won't stall Redis |
+| Scanning too frequently | Configurable interval (`reconcile_interval_seconds`); set to 0 to disable |
+| False positives during active writes | Settle delay (1/3 of interval, clamped 5–15 s) absorbs in-flight events |
+
+**Overhead estimate by dataset size:**
+
+| Key count | Round trips (pipelined) | Wall-clock time |
+|-----------|------------------------|-----------------|
+| 100k | ~1,000 | ~100ms |
+| 1M | ~10,000 | ~1s |
+| 10M | ~100,000 | ~10s |
+
+For large deployments, increase `reconcile_interval_seconds` proportionally (e.g., 300 s for 10M keys).
+
+### Configuration
+
+```yaml
+replication:
+  reconcile_interval_seconds: 30   # Default: 30s. Set to 0 to disable.
+```
+
+**Tuning guide:**
+
+| Deployment size | Recommended interval |
+|-----------------|----------------------|
+| < 500k keys | 30s (default) |
+| 500k – 5M keys | 120s |
+| 5M – 20M keys | 300s |
+| > 20M keys | 600s or disable + rely on stream catch-up |
+
+### Log Messages
+
+| Message | Meaning |
+|---------|---------|
+| `reconciler: started interval=30s settle=10s` | Reconciler goroutine is active |
+| `reconciler: keys without meta (settling) count=N` | N candidates found; waiting for settle |
+| `reconciler: re-publishing missed event key=X` | PubSub drop confirmed; re-publishing |
+| `reconciler: done republished=N` | Cycle complete; N keys recovered |
+| `reconciler: disabled (reconcile_interval_seconds=0)` | Reconciler turned off by config |
+
+---
+
 ## Frequently Asked Questions
 
 **Q: What if Site-B is down for an hour while Site-A writes 10,000 keys?**  

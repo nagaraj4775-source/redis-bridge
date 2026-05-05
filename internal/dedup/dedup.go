@@ -31,13 +31,11 @@ func NewFilter(client redis.UniversalClient, ttlMs int, cacheSize int) (*Filter,
 	if err != nil {
 		return nil, fmt.Errorf("create LRU cache: %w", err)
 	}
-	// shadowTTL must be long enough to cover the keyspace-event round-trip AND
-	// the concurrent producer semaphore wait, but short enough that original
-	// write events (which can be delayed by docker-exec or network latency)
-	// find the shadow expired so they get published. 200ms is the sweet spot:
-	// covers the Apply event dispatch (~15ms worst case) while expiring before
-	// delayed external writes arrive (~200-500ms via docker exec).
-	shTTL := 200 * time.Millisecond
+	// shadowTTL must cover the full keyspace-event round-trip at peak load.
+	// At 38k+ writes/s, PubSub delivery can be delayed several seconds due to
+	// Redis server load. Using the configured dedup_ttl_seconds (default 5s)
+	// ensures loopback detection works even under heavy burst loads.
+	shTTL := time.Duration(ttlMs) * time.Millisecond
 	return &Filter{
 		client:    client,
 		seqCache:  cache,

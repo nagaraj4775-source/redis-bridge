@@ -116,7 +116,8 @@ func main() {
 	app := applier.New(localClient, dd, logger)
 
 	// Create producer
-	prod := producer.New(cfg.SiteID, masters, localClient, replBus, clock, dd, logger)
+	prod := producer.New(cfg.SiteID, masters, localClient, replBus, clock, dd, logger).
+		WithReconcileInterval(time.Duration(cfg.Replication.ReconcileIntervalSeconds) * time.Second)
 
 	// In cluster mode, enable automatic re-subscription when a replica is
 	// promoted to master. The producer polls CLUSTER topology every 10 s and
@@ -315,8 +316,8 @@ func buildClusterClients(ctx context.Context, cfg *config.Config, logger *zap.Lo
 		cc := redis.NewClusterClient(&redis.ClusterOptions{
 			Addrs:        cfg.Cluster.Masters,
 			Password:     cfg.Cluster.Password,
-			PoolSize:     32,
-			MinIdleConns: 4,
+			PoolSize:     200, // support 200 concurrent workers per node
+			MinIdleConns: 8,
 			ReadTimeout:  3 * time.Second,
 			WriteTimeout: 3 * time.Second,
 		})

@@ -34,6 +34,7 @@ replication:
   apply_concurrency: 8      # Parallel goroutines applying messages from a single peer stream
   dedup_ttl_seconds: 5      # Shadow key TTL (seconds) used to suppress replication loops
   max_in_flight: 1000       # Max unacknowledged messages before the consumer pauses (backpressure)
+  reconcile_interval_seconds: 30  # How often (seconds) the reconciler scans for PubSub-missed keys; 0 = disabled
 
 # ─ HTTP coordinator API ──────────────────────────────────────────────────────
 coordinator:

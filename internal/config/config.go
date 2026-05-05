@@ -69,10 +69,11 @@ type BusConfig struct {
 }
 
 type ReplicationConfig struct {
-	BatchSize        int `mapstructure:"batch_size"`
-	ApplyConcurrency int `mapstructure:"apply_concurrency"`
-	DedupTTLSeconds  int `mapstructure:"dedup_ttl_seconds"`
-	MaxInFlight      int `mapstructure:"max_in_flight"`
+	BatchSize                int `mapstructure:"batch_size"`
+	ApplyConcurrency         int `mapstructure:"apply_concurrency"`
+	DedupTTLSeconds          int `mapstructure:"dedup_ttl_seconds"`
+	MaxInFlight              int `mapstructure:"max_in_flight"`
+	ReconcileIntervalSeconds int `mapstructure:"reconcile_interval_seconds"` // 0 = disabled
 }
 
 type CoordinatorConfig struct {
@@ -104,6 +105,7 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("replication.apply_concurrency", 8)
 	v.SetDefault("replication.dedup_ttl_seconds", 5)
 	v.SetDefault("replication.max_in_flight", 1000)
+	v.SetDefault("replication.reconcile_interval_seconds", 30)
 	v.SetDefault("coordinator.port", 8080)
 	v.SetDefault("metrics.port", 9090)
 
