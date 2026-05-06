@@ -45,12 +45,26 @@ return 0
 
 // Tracked keyspace commands
 var trackedCommands = map[string]bool{
-	"set": true, "setex": true, "psetex": true, "mset": true,
-	"hset": true, "hmset": true,
-	"lpush": true, "rpush": true,
-	"sadd": true,
-	"zadd": true,
-	"del": true, "expire": true, "persist": true,
+	// String writes
+	"set": true, "setex": true, "psetex": true, "mset": true, "msetnx": true, "setnx": true,
+	"incr": true, "incrby": true, "incrbyfloat": true,
+	"decr": true, "decrby": true,
+	"append": true, "setrange": true, "getset": true, "getdel": true, "getex": true,
+	// Hash writes
+	"hset": true, "hmset": true, "hsetnx": true,
+	"hincrby": true, "hincrbyfloat": true,
+	"hdel": true,
+	// List writes
+	"lpush": true, "rpush": true, "lpushx": true, "rpushx": true,
+	"lpop": true, "rpop": true, "lmove": true, "rpoplpush": true,
+	"lset": true, "linsert": true, "lrem": true, "ltrim": true,
+	// Set writes
+	"sadd": true, "srem": true, "spop": true, "smove": true,
+	// Sorted set writes
+	"zadd": true, "zincrby": true, "zrem": true, "zpopmin": true, "zpopmax": true,
+	// Key lifecycle
+	"del": true, "unlink": true, "expire": true, "pexpire": true,
+	"expireat": true, "pexpireat": true, "persist": true,
 	"rename": true, "copy": true,
 }
 
