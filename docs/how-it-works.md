@@ -412,6 +412,142 @@ replication:
 
 ---
 
+## Replication Configuration Reference
+
+All options live under the `replication:` key in `agent.yaml`.
+
+```yaml
+replication:
+  batch_size: 100
+  apply_concurrency: 8
+  dedup_ttl_seconds: 5
+  max_in_flight: 1000
+  reconcile_interval_seconds: 30
+```
+
+---
+
+### `batch_size`
+
+How many stream entries the agent reads **per `XREADGROUP` call** per peer.
+
+```
+Stream has 500 pending entries from site-b.
+
+batch_size=100 → agent reads 100 at a time:
+  Round 1: reads entries 1–100   → applies → ACKs
+  Round 2: reads entries 101–200 → applies → ACKs
+  ... 5 rounds to drain 500 entries
+
+batch_size=500 → 1 round, but one large blocking call
+```
+
+| Value | Best for |
+|-------|----------|
+| `50–100` | Memory-constrained agents or very large value sizes |
+| `100–500` | General workloads (default `100` is safe) |
+| `500–1000` | Catching up after long downtime, high-throughput writes |
+
+---
+
+### `apply_concurrency`
+
+How many goroutines apply messages **in parallel** from a single peer stream.
+
+```
+100 entries arrive from site-b.
+
+apply_concurrency=1 → applied one by one:   ~100ms (serial)
+apply_concurrency=8 → applied 8 at a time:  ~13ms  (8× faster)
+
+Key-level serialization still applies — two writes to the
+same key are always applied in order, even at concurrency=8.
+```
+
+Cap this at your Redis connection pool size. The default `8` works well for most deployments. Scale-out consumers (role: consumer) can run higher concurrency safely.
+
+---
+
+### `dedup_ttl_seconds`
+
+How long the **shadow key** lives after a consumer applies a write, used to suppress replication loops.
+
+```
+t=0ms   Consumer applies: SET price 200
+         → writes shadow: __repl:applying:price = CRC32("200")  TTL=5s
+
+t=1ms   Site-b Redis fires keyspace event: "price was set"
+t=1ms   Producer checks shadow: hash matches → SKIP (not a new write)
+
+t=5001ms Shadow key expires
+t=5002ms User writes: SET price 300  ← a real new write
+          Producer checks shadow: expired → PUBLISH ✓
+```
+
+| Value | Risk |
+|-------|------|
+| `< 1s` | Shadow expires before PubSub event arrives → replication loop |
+| `5s` | Sweet spot for LAN / Docker deployments (default) |
+| `10s` | Recommended over WAN or high-latency links |
+| `> 30s` | Legitimate local writes within that window may be suppressed |
+
+---
+
+### `max_in_flight`
+
+Max **unacknowledged** stream entries before the consumer pauses (backpressure control).
+
+```
+Site-b publishes a burst of 5,000 entries.
+max_in_flight=1000, apply_concurrency=8
+
+t=0s   Consumer reads batch of 100 → starts applying (8 at a time)
+       in-flight count = 100
+t=0.1s reads next batch → in-flight = 200
+...
+t=1s   in-flight reaches 1,000 → PAUSE reading new entries
+       Apply workers keep draining...
+t=1.5s in-flight drops to 800 → RESUME reading
+```
+
+This prevents the agent from reading faster than it can apply, stopping the Redis PEL (pending entry list) from growing unboundedly and consuming memory.
+
+**Rule of thumb:** `batch_size × apply_concurrency × 2`
+
+| batch_size | apply_concurrency | Suggested max_in_flight |
+|------------|-------------------|------------------------|
+| 100 | 8 | 1,000–2,000 |
+| 200 | 16 | 4,000–8,000 |
+| 500 | 32 | 16,000–32,000 |
+
+---
+
+### `reconcile_interval_seconds`
+
+How often the background reconciler scans for keys **silently dropped by PubSub**.
+
+```
+t=0s    Reconciler starts: SCAN all keys on all masters
+         key "bench:532" found → no __meta: anchor → candidate
+
+t=10s   Settle delay elapses: re-check candidate
+         bench:532 still has no __meta: → PubSub drop confirmed
+         → re-publish bench:532 to stream → site-b receives it ✓
+
+t=30s   Next reconciler cycle begins
+```
+
+| Value | Effect |
+|-------|--------|
+| `30` | Scan every 30s — suitable for < 500k keys |
+| `120` | Every 2 min — recommended for 500k–5M keys |
+| `300` | Every 5 min — recommended for 5M–20M keys |
+| `0` | **Disabled** — rely on stream catch-up only |
+
+The scan is non-blocking (cursor-based `SCAN`) and uses pipelined `EXISTS` checks in batches of 100, so it adds minimal load. For datasets > 5M keys, increase the interval proportionally so cycles don't overlap.
+
+---
+
 ## Management HTTP API
 
 Every agent exposes an HTTP management API on `coordinator.port` (default `8080`).
