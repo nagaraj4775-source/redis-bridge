@@ -198,6 +198,9 @@ func (c *Consumer) consumePeer(ctx context.Context, peerID string) {
 		c.mu.Unlock()
 
 		msgs, err := c.bus.Consume(peerCtx, peerID, c.groupName(), consumerName, c.batchSize, startID)
+		// Capture whether peerCtx was cancelled by Pause() BEFORE calling cancel(),
+		// so we can distinguish an intentional pause from a real transport error.
+		pauseInterrupted := peerCtx.Err() != nil && ctx.Err() == nil
 		cancel()
 
 		// When reading PEL ("0") returns empty, the backlog is drained —
@@ -210,6 +213,11 @@ func (c *Consumer) consumePeer(ctx context.Context, peerID string) {
 		if err != nil {
 			if ctx.Err() != nil {
 				return
+			}
+			if pauseInterrupted {
+				// peerCtx was cancelled by Pause() — not a transport error.
+				// Skip the error log and back-off sleep; let IsPaused handle it.
+				continue
 			}
 			logger.Error("consume error", zap.Error(err))
 			time.Sleep(1 * time.Second)

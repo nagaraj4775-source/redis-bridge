@@ -39,6 +39,7 @@ func New(cfg *config.Config, cons *consumer.Consumer, prod *producer.Producer, l
 func (c *Coordinator) Run() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", c.handleHealth)
+	mux.HandleFunc("/status", c.handleStatus)
 	mux.HandleFunc("/lag", c.handleLag)
 	mux.HandleFunc("/stats", c.handleStats)
 	mux.HandleFunc("/pause", c.handlePause)
@@ -100,18 +101,41 @@ func (c *Coordinator) handleLag(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleStatus returns a comprehensive one-call overview of this agent.
+// GET /status
+func (c *Coordinator) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	resp := map[string]interface{}{
+		"site_id":  c.cfg.SiteID,
+		"status":   "ok",
+		"uptime_s": int(time.Since(c.startedAt).Seconds()),
+		"role":     c.cfg.Role,
+		"peers":    c.consumer.PeerLags(ctx),
+	}
+	if c.producer != nil {
+		resp["reconciler"] = c.producer.GetReconcileStatus()
+		resp["bootstrap"] = c.producer.GetBootstrapStatus()
+	}
+	writeJSON(w, resp)
+}
+
 func (c *Coordinator) handleStats(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	// Prometheus metrics are exposed on the metrics port.
-	// This endpoint returns a summary.
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
 	resp := map[string]interface{}{
 		"site_id":      c.cfg.SiteID,
-		"peers":        c.cfg.Peers,
+		"peers":        c.consumer.PeerLags(ctx),
 		"metrics_port": c.cfg.Metrics.Port,
-		"message":      "Full metrics available at /metrics on the metrics port",
 	}
 	writeJSON(w, resp)
 }

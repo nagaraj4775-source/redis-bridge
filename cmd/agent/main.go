@@ -24,14 +24,22 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 func main() {
 	configPath := flag.String("config", "config/agent.yaml", "Path to config file")
 	flag.Parse()
 
-	// Structured logger
-	logger, err := zap.NewProduction()
+	// Structured logger — human-readable timestamps in the container's local timezone.
+	encoderCfg := zap.NewProductionEncoderConfig()
+	encoderCfg.TimeKey = "time"
+	encoderCfg.EncodeTime = func(t time.Time, enc zapcore.PrimitiveArrayEncoder) {
+		enc.AppendString(t.Local().Format("2006-01-02T15:04:05.000Z07:00"))
+	}
+	zapCfg := zap.NewProductionConfig()
+	zapCfg.EncoderConfig = encoderCfg
+	logger, err := zapCfg.Build()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to init logger: %v\n", err)
 		os.Exit(1)

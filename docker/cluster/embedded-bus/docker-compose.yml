@@ -22,21 +22,21 @@ services:
   # ─── Site A Masters ───
   redis-a-master1:
     image: redis:7-alpine
-    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-a-master1 --cluster-preferred-endpoint-type hostname
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-a-master1 --cluster-announce-port 6379 --cluster-preferred-endpoint-type hostname
     ports: ["6411:6379"]
     volumes: [redis-a-master1-data:/data]
     networks: [replnet]
 
   redis-a-master2:
     image: redis:7-alpine
-    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-a-master2 --cluster-preferred-endpoint-type hostname
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-a-master2 --cluster-announce-port 6379 --cluster-preferred-endpoint-type hostname
     ports: ["6412:6379"]
     volumes: [redis-a-master2-data:/data]
     networks: [replnet]
 
   redis-a-master3:
     image: redis:7-alpine
-    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-a-master3 --cluster-preferred-endpoint-type hostname
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-a-master3 --cluster-announce-port 6379 --cluster-preferred-endpoint-type hostname
     ports: ["6413:6379"]
     volumes: [redis-a-master3-data:/data]
     networks: [replnet]
@@ -44,21 +44,21 @@ services:
   # ─── Site A Replicas (1 replica per master — enables Step 11 failover demo) ───
   redis-a-replica1:
     image: redis:7-alpine
-    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-a-replica1 --cluster-preferred-endpoint-type hostname
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-a-replica1 --cluster-announce-port 6379 --cluster-preferred-endpoint-type hostname
     ports: ["6421:6379"]
     volumes: [redis-a-replica1-data:/data]
     networks: [replnet]
 
   redis-a-replica2:
     image: redis:7-alpine
-    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-a-replica2 --cluster-preferred-endpoint-type hostname
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-a-replica2 --cluster-announce-port 6379 --cluster-preferred-endpoint-type hostname
     ports: ["6422:6379"]
     volumes: [redis-a-replica2-data:/data]
     networks: [replnet]
 
   redis-a-replica3:
     image: redis:7-alpine
-    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-a-replica3 --cluster-preferred-endpoint-type hostname
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-a-replica3 --cluster-announce-port 6379 --cluster-preferred-endpoint-type hostname
     ports: ["6423:6379"]
     volumes: [redis-a-replica3-data:/data]
     networks: [replnet]
@@ -66,21 +66,21 @@ services:
   # ─── Site B Masters ───
   redis-b-master1:
     image: redis:7-alpine
-    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-b-master1 --cluster-preferred-endpoint-type hostname
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-b-master1 --cluster-announce-port 6379 --cluster-preferred-endpoint-type hostname
     ports: ["6414:6379"]
     volumes: [redis-b-master1-data:/data]
     networks: [replnet]
 
   redis-b-master2:
     image: redis:7-alpine
-    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-b-master2 --cluster-preferred-endpoint-type hostname
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-b-master2 --cluster-announce-port 6379 --cluster-preferred-endpoint-type hostname
     ports: ["6415:6379"]
     volumes: [redis-b-master2-data:/data]
     networks: [replnet]
 
   redis-b-master3:
     image: redis:7-alpine
-    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-b-master3 --cluster-preferred-endpoint-type hostname
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-b-master3 --cluster-announce-port 6379 --cluster-preferred-endpoint-type hostname
     ports: ["6416:6379"]
     volumes: [redis-b-master3-data:/data]
     networks: [replnet]
@@ -88,21 +88,21 @@ services:
   # ─── Site C Masters ───
   redis-c-master1:
     image: redis:7-alpine
-    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-c-master1 --cluster-preferred-endpoint-type hostname
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-c-master1 --cluster-announce-port 6379 --cluster-preferred-endpoint-type hostname
     ports: ["6417:6379"]
     volumes: [redis-c-master1-data:/data]
     networks: [replnet]
 
   redis-c-master2:
     image: redis:7-alpine
-    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-c-master2 --cluster-preferred-endpoint-type hostname
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-c-master2 --cluster-announce-port 6379 --cluster-preferred-endpoint-type hostname
     ports: ["6418:6379"]
     volumes: [redis-c-master2-data:/data]
     networks: [replnet]
 
   redis-c-master3:
     image: redis:7-alpine
-    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-c-master3 --cluster-preferred-endpoint-type hostname
+    command: redis-server --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 5000 --cluster-require-full-coverage no --notify-keyspace-events KEA --save "" --appendonly no --cluster-announce-hostname redis-c-master3 --cluster-announce-port 6379 --cluster-preferred-endpoint-type hostname
     ports: ["6419:6379"]
     volumes: [redis-c-master3-data:/data]
     networks: [replnet]

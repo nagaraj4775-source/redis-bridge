@@ -65,7 +65,7 @@ var trackedCommands = map[string]bool{
 	// Key lifecycle
 	"del": true, "unlink": true, "expire": true, "pexpire": true,
 	"expireat": true, "pexpireat": true, "persist": true,
-	"rename": true, "copy": true,
+	"rename_from": true, "rename_to": true, "copy_to": true,
 }
 
 // ReconcileStatus is a JSON-serialisable snapshot of the last reconciler cycle.
@@ -695,7 +695,7 @@ func (p *Producer) handleEvent(ctx context.Context, msg *redis.Message, shadowAt
 	// Read key value and TTL via dataClient (auto-routes to correct shard in cluster mode).
 	keyType, value, err := reader.ReadValue(ctx, p.dataClient, key)
 	if err != nil {
-		if cmd == "del" {
+		if cmd == "del" || cmd == "unlink" || cmd == "rename_from" || cmd == "getdel" {
 			keyType = "none"
 			value = nil
 		} else {
