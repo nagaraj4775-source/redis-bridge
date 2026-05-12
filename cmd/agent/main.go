@@ -126,6 +126,9 @@ func main() {
 	// Create producer
 	prod := producer.New(cfg.SiteID, masters, localClient, replBus, clock, dd, logger).
 		WithReconcileInterval(time.Duration(cfg.Replication.ReconcileIntervalSeconds) * time.Second).
+		WithReconcileStartupDelay(time.Duration(cfg.Replication.ReconcileStartupDelaySeconds) * time.Second).
+		WithReconcileScanBatch(cfg.Replication.ReconcileScanBatchSize).
+		WithAutoBootstrapThreshold(cfg.Replication.AutoBootstrapThreshold).
 		WithPatternFilter(cfg.Replication.IncludePatterns, cfg.Replication.ExcludePatterns)
 
 	// In cluster mode, enable automatic re-subscription when a replica is

@@ -39,6 +39,9 @@ replication:
   dedup_ttl_seconds: 5      # Shadow key TTL (seconds) used to suppress replication loops
   max_in_flight: 1000       # Max unacknowledged messages before the consumer pauses (backpressure)
   reconcile_interval_seconds: 30  # How often (seconds) the reconciler scans for PubSub-missed keys; 0 = disabled
+  reconcile_startup_delay_seconds: 60   # hold off first reconcile after restart so consumer can drain PEL from peers (0 = no delay)
+  reconcile_scan_batch_size: 500    # keys per SCAN cursor hop and HMGET pipeline batch during reconciler scan (default 500; increase for large clusters)
+  auto_bootstrap_threshold: 0      # if missing-meta keys exceed this during reconcile, auto-trigger bootstrap instead (0 = disabled)
   # Pattern filtering (Feature 5): replicate only matching keys.
   # include_patterns:    # if set, only keys matching at least one pattern are replicated
   #   - "users:*"

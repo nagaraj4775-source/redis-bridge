@@ -3,6 +3,7 @@ package producer
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"path"
 	"strconv"
 	"strings"
@@ -26,7 +27,7 @@ import (
 var metaCAS = redis.NewScript(`
 local existing = redis.call('HGET', KEYS[1], 'hlc')
 if existing == false then
-    redis.call('HSET', KEYS[1], 'hlc', ARGV[1], 'site', ARGV[2])
+    redis.call('HSET', KEYS[1], 'hlc', ARGV[1], 'site', ARGV[2], 'val_hash', ARGV[3])
     return 1
 end
 -- uint64 safe comparison: tonumber() loses precision above 2^53.
@@ -37,7 +38,7 @@ local function u64lt(a, b)
     return a < b
 end
 if u64lt(existing, ARGV[1]) then
-    redis.call('HSET', KEYS[1], 'hlc', ARGV[1], 'site', ARGV[2])
+    redis.call('HSET', KEYS[1], 'hlc', ARGV[1], 'site', ARGV[2], 'val_hash', ARGV[3])
     return 1
 end
 return 0
@@ -74,7 +75,8 @@ type ReconcileStatus struct {
 	LastRunAt    time.Time `json:"last_run_at,omitempty"`
 	LastScanMs   int64     `json:"last_scan_ms"`
 	LastRepaired int       `json:"last_repaired"`
-	TotalRuns    int64     `json:"total_runs"`
+	LastDrifted  int       `json:"last_drifted"`  // keys with meta but changed value (missed updates)
+	TotalRuns    int       `json:"total_runs"`
 }
 
 // BootstrapStatus is a JSON-serialisable snapshot of bootstrap progress.
@@ -118,7 +120,11 @@ type Producer struct {
 	dedup             *dedup.Filter
 	logger            *zap.Logger
 	seqNo             atomic.Uint64
-	reconcileInterval time.Duration // 0 = disabled
+	bootEpochMs         int64          // ms timestamp captured at New(); baked into every SeqID to prevent cross-restart collisions
+	reconcileInterval   time.Duration  // 0 = disabled
+	reconcileScanBatch       int // keys per SCAN cursor hop and HMGET pipeline batch (default 500)
+	autoBootstrapThreshold  int           // if missing-meta keys > this, auto-start bootstrap (0 = disabled)
+	reconcileStartupDelay   time.Duration // hold off first reconcile after restart (0 = no delay)
 
 	// Pattern filtering (Feature 5)
 	includeGlobs []string // if non-empty, key must match at least one
@@ -144,18 +150,22 @@ type Producer struct {
 // dataClient is used for all data operations and can be a ClusterClient for automatic routing.
 func New(siteID string, masters []*redis.Client, dataClient redis.UniversalClient, b bus.Bus, clock *hlc.HLC, dd *dedup.Filter, logger *zap.Logger) *Producer {
 	return &Producer{
-		siteID:           siteID,
-		masters:          masters,
-		dataClient:       dataClient,
-		bus:              b,
-		clock:            clock,
-		dedup:            dd,
-		logger:           logger,
-		subSet:           make(map[string]context.CancelFunc),
-		reconcileInterval: 30 * time.Second, // default; override with WithReconcileInterval
-		reconcileTrigger: make(chan struct{}, 1),
-		reconcileStatus:  ReconcileStatus{Enabled: true},
-		bootstrapProg:    &bootstrapProgress{state: "idle"},
+		siteID:            siteID,
+		masters:           masters,
+		dataClient:        dataClient,
+		bus:               b,
+		clock:             clock,
+		dedup:             dd,
+		logger:            logger,
+		bootEpochMs:        time.Now().UnixMilli(),
+		subSet:             make(map[string]context.CancelFunc),
+		reconcileInterval:  30 * time.Second, // default; override with WithReconcileInterval
+		reconcileScanBatch:      500, // default; override with WithReconcileScanBatch
+		autoBootstrapThreshold:  0,             // disabled by default; override with WithAutoBootstrapThreshold
+		reconcileStartupDelay:   0,             // no delay by default; override with WithReconcileStartupDelay
+		reconcileTrigger:  make(chan struct{}, 1),
+		reconcileStatus:   ReconcileStatus{Enabled: true},
+		bootstrapProg:     &bootstrapProgress{state: "idle"},
 	}
 }
 
@@ -163,6 +173,37 @@ func New(siteID string, masters []*redis.Client, dataClient redis.UniversalClien
 // Set to 0 to disable the reconciler entirely.
 func (p *Producer) WithReconcileInterval(d time.Duration) *Producer {
 	p.reconcileInterval = d
+	return p
+}
+
+// WithReconcileScanBatch sets the number of keys fetched per SCAN cursor hop and
+// per HMGET pipeline batch during reconciler Phase 1 and Phase 2.
+// Larger values reduce round-trips but increase per-call memory. Default: 500.
+func (p *Producer) WithReconcileScanBatch(n int) *Producer {
+	if n > 0 {
+		p.reconcileScanBatch = n
+	}
+	return p
+}
+
+// WithAutoBootstrapThreshold sets the number of missing-meta keys that will
+// cause the reconciler to auto-trigger a full bootstrap instead of reconciling
+// them one-by-one. Useful after prolonged producer downtime when thousands of
+// new keys were inserted. Set to 0 (default) to disable auto-bootstrap.
+func (p *Producer) WithAutoBootstrapThreshold(n int) *Producer {
+	p.autoBootstrapThreshold = n
+	return p
+}
+
+// WithReconcileStartupDelay sets a one-time hold-off applied at agent startup
+// before the reconciler is allowed to run for the first time (timer OR manual
+// POST /reconcile). This gives the consumer time to drain the PEL from all
+// peers and apply their updates before the reconciler scans for drift.
+// Without this, a manual reconcile triggered immediately after restart can
+// republish stale drifted values with a high HLC and overwrite more-recent
+// peer updates. Default: 0 (no delay).
+func (p *Producer) WithReconcileStartupDelay(d time.Duration) *Producer {
+	p.reconcileStartupDelay = d
 	return p
 }
 
@@ -456,7 +497,27 @@ func (p *Producer) runReconciler(ctx context.Context) {
 	}
 	p.logger.Info("reconciler: started",
 		zap.Duration("interval", p.reconcileInterval),
-		zap.Duration("settle", settleDelay))
+		zap.Duration("settle", settleDelay),
+		zap.Duration("startup_delay", p.reconcileStartupDelay))
+
+	// Startup delay: block both timer and manual triggers until the consumer
+	// has had time to drain PEL from all peers. This prevents the reconciler
+	// from republishing stale drifted values before peer updates are applied.
+	if p.reconcileStartupDelay > 0 {
+		p.logger.Info("reconciler: holding off for startup delay",
+			zap.Duration("delay", p.reconcileStartupDelay))
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(p.reconcileStartupDelay):
+			// Drain any manual triggers queued during the hold-off window.
+			for len(p.reconcileTrigger) > 0 {
+				<-p.reconcileTrigger
+			}
+			p.logger.Info("reconciler: startup delay elapsed, ready")
+		}
+	}
+
 	ticker := time.NewTicker(p.reconcileInterval)
 	defer ticker.Stop()
 	for {
@@ -474,7 +535,7 @@ func (p *Producer) runReconciler(ctx context.Context) {
 
 func (p *Producer) reconcileMissedEvents(ctx context.Context, settleDelay time.Duration) {
 	scanStart := time.Now()
-	candidates, err := p.scanMissingMeta(ctx)
+	missing, drifted, err := p.scanDriftedKeys(ctx)
 	scanMs := time.Since(scanStart).Milliseconds()
 
 	if err != nil {
@@ -483,57 +544,107 @@ func (p *Producer) reconcileMissedEvents(ctx context.Context, settleDelay time.D
 	}
 	metrics.ReconcilerScanDurationMs.WithLabelValues(p.siteID).Observe(float64(scanMs))
 
-	if len(candidates) == 0 {
-		p.updateReconcileStatus(scanMs, 0)
+	if len(missing) == 0 && len(drifted) == 0 {
+		p.updateReconcileStatus(scanMs, 0, 0)
 		return
-	}
-	p.logger.Info("reconciler: keys without meta (settling)",
-		zap.Int("count", len(candidates)), zap.Duration("settle", settleDelay))
-
-	select {
-	case <-ctx.Done():
-		return
-	case <-time.After(settleDelay):
 	}
 
 	republished := 0
-	for _, key := range candidates {
-		if ctx.Err() != nil {
-			return
+
+	// ── Auto-bootstrap check: if missing keys exceed threshold, delegate to bootstrap ──
+	if p.autoBootstrapThreshold > 0 && len(missing) > p.autoBootstrapThreshold {
+		p.logger.Warn("reconciler: missing keys exceed auto-bootstrap threshold — triggering bootstrap",
+			zap.Int("missing", len(missing)),
+			zap.Int("threshold", p.autoBootstrapThreshold))
+		if err := p.StartBootstrap(ctx); err != nil {
+			// Already running or other error — fall through to normal reconcile
+			p.logger.Warn("reconciler: auto-bootstrap could not start, falling back to reconcile",
+				zap.Error(err))
+		} else {
+			// Bootstrap started — skip the slow one-by-one missing-key path.
+			// Still process drifted keys immediately (they are confirmed value changes).
+			missing = nil
 		}
-		exists, err := p.dataClient.Exists(ctx, "__meta:"+key).Result()
-		if err != nil || exists > 0 {
-			continue // PubSub caught up during settle window
-		}
-		p.logger.Info("reconciler: re-publishing missed event", zap.String("key", key))
-		p.handleEvent(ctx, &redis.Message{
-			Channel: "__keyevent@0__:set",
-			Payload: key,
-		}, 0, p.logger)
-		republished++
 	}
+
+	// ── Missing-meta keys: wait for settle so in-flight PubSub events can arrive ──
+	if len(missing) > 0 {
+		p.logger.Info("reconciler: keys without meta (settling)",
+			zap.Int("count", len(missing)), zap.Duration("settle", settleDelay))
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(settleDelay):
+		}
+		for _, key := range missing {
+			if ctx.Err() != nil {
+				return
+			}
+			exists, err := p.dataClient.Exists(ctx, "__meta:"+key).Result()
+			if err != nil || exists > 0 {
+				continue // PubSub caught up during settle window
+			}
+			p.logger.Info("reconciler: re-publishing missed event (no meta)", zap.String("key", key))
+			p.handleEvent(ctx, &redis.Message{Channel: "__keyevent@0__:set", Payload: key}, 0, p.logger)
+			republished++
+		}
+	}
+
+	// ── Drifted keys: meta exists but value changed while producer was down ──
+	// No settle delay needed — meta anchor is present, this is a confirmed missed update.
+	if len(drifted) > 0 {
+		p.logger.Info("reconciler: value-drifted keys detected", zap.Int("count", len(drifted)))
+		for _, key := range drifted {
+			if ctx.Err() != nil {
+				return
+			}
+			p.logger.Info("reconciler: re-publishing drifted key (value changed)", zap.String("key", key))
+			p.handleEvent(ctx, &redis.Message{Channel: "__keyevent@0__:set", Payload: key}, 0, p.logger)
+			republished++
+		}
+	}
+
 	if republished > 0 {
-		p.logger.Info("reconciler: done", zap.Int("republished", republished))
+		p.logger.Info("reconciler: done",
+			zap.Int("republished", republished),
+			zap.Int("drifted", len(drifted)))
 		metrics.ReconcilerRepairedTotal.WithLabelValues(p.siteID).Add(float64(republished))
 	}
 	metrics.ReconcilerRunsTotal.WithLabelValues(p.siteID).Inc()
-	p.updateReconcileStatus(scanMs, republished)
+	p.updateReconcileStatus(scanMs, republished, len(drifted))
 }
 
-func (p *Producer) updateReconcileStatus(scanMs int64, repaired int) {
+func (p *Producer) updateReconcileStatus(scanMs int64, repaired, drifted int) {
 	p.reconcileStatusMu.Lock()
 	defer p.reconcileStatusMu.Unlock()
 	p.reconcileStatus.LastRunAt = time.Now()
 	p.reconcileStatus.LastScanMs = scanMs
 	p.reconcileStatus.LastRepaired = repaired
+	p.reconcileStatus.LastDrifted = drifted
 	p.reconcileStatus.TotalRuns++
 }
 
-// scanMissingMeta returns all non-internal keys that have no __meta: entry.
-// Phase 1: SCAN all masters to collect data keys (respecting pattern filter).
-// Phase 2: Pipeline EXISTS checks in batches of 100 (100x fewer round trips
-// vs one EXISTS per key).
-func (p *Producer) scanMissingMeta(ctx context.Context) ([]string, error) {
+// hashValue returns a compact FNV-1a 64-bit hex hash of a serialised value.
+// Used to detect whether a key's value changed between reconciler cycles
+// without storing the full value in __meta:.
+func hashValue(b []byte) string {
+	if len(b) == 0 {
+		return "empty"
+	}
+	h := fnv.New64a()
+	h.Write(b)
+	return strconv.FormatUint(h.Sum64(), 16)
+}
+
+// scanDriftedKeys returns two lists of candidate keys for republishing:
+//   - missing: keys with no __meta: entry (never replicated or meta was deleted)
+//   - drifted: keys whose __meta:val_hash differs from the current value hash
+//     (value changed while the producer was down — confirmed missed update)
+//
+// Phase 1: SCAN all masters for data keys (respecting pattern filter).
+// Phase 2: Pipeline HMGET __meta:{key} val_hash in batches of 100.
+// Phase 3: For keys with a stored hash, read current value and compare.
+func (p *Producer) scanDriftedKeys(ctx context.Context) (missing, drifted []string, err error) {
 	var (
 		mu      sync.Mutex
 		allKeys []string
@@ -543,9 +654,9 @@ func (p *Producer) scanMissingMeta(ctx context.Context) ([]string, error) {
 	scanNode := func(scanCtx context.Context, c *redis.Client) error {
 		var cursor uint64
 		for {
-			keys, next, err := c.Scan(scanCtx, cursor, "*", 500).Result()
-			if err != nil {
-				return err
+			keys, next, scanErr := c.Scan(scanCtx, cursor, "*", int64(p.reconcileScanBatch)).Result()
+			if scanErr != nil {
+				return scanErr
 			}
 			var local []string
 			for _, key := range keys {
@@ -571,23 +682,28 @@ func (p *Producer) scanMissingMeta(ctx context.Context) ([]string, error) {
 	}
 
 	if cc, ok := p.dataClient.(*redis.ClusterClient); ok {
-		if err := cc.ForEachMaster(ctx, scanNode); err != nil {
-			return nil, fmt.Errorf("reconciler ForEachMaster: %w", err)
+		if err = cc.ForEachMaster(ctx, scanNode); err != nil {
+			return nil, nil, fmt.Errorf("reconciler ForEachMaster: %w", err)
 		}
 	} else if c, ok := p.dataClient.(*redis.Client); ok {
-		if err := scanNode(ctx, c); err != nil {
-			return nil, err
+		if err = scanNode(ctx, c); err != nil {
+			return nil, nil, err
 		}
 	}
 
 	if len(allKeys) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
-	// Phase 2: pipeline EXISTS __meta:{key} in batches of 100.
-	// This reduces N round trips to N/100 round trips.
-	const pipelineBatch = 100
-	var missing []string
+	// Phase 2: pipeline HMGET __meta:{key} val_hash in batches of 100.
+	// Keys with no meta → missing. Keys with a stored hash → candidates for Phase 3.
+	pipelineBatch := p.reconcileScanBatch
+	type hashCandidate struct {
+		key  string
+		hash string
+	}
+	var hashCandidates []hashCandidate
+
 	for i := 0; i < len(allKeys); i += pipelineBatch {
 		end := i + pipelineBatch
 		if end > len(allKeys) {
@@ -596,20 +712,46 @@ func (p *Producer) scanMissingMeta(ctx context.Context) ([]string, error) {
 		batch := allKeys[i:end]
 
 		pipe := p.dataClient.Pipeline()
-		cmds := make([]*redis.IntCmd, len(batch))
+		cmds := make([]*redis.SliceCmd, len(batch))
 		for j, key := range batch {
-			cmds[j] = pipe.Exists(ctx, "__meta:"+key)
+			cmds[j] = pipe.HMGet(ctx, "__meta:"+key, "val_hash")
 		}
-		if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
-			return nil, fmt.Errorf("reconciler pipeline EXISTS: %w", err)
+		if _, pipeErr := pipe.Exec(ctx); pipeErr != nil && pipeErr != redis.Nil {
+			return nil, nil, fmt.Errorf("reconciler pipeline HMGET: %w", pipeErr)
 		}
 		for j, cmd := range cmds {
-			if cmd.Val() == 0 {
-				missing = append(missing, batch[j])
+			key := batch[j]
+			vals, cmdErr := cmd.Result()
+			if cmdErr != nil || len(vals) == 0 || vals[0] == nil {
+				// No __meta: key, or meta without val_hash (legacy) → treat as missing.
+				missing = append(missing, key)
+				continue
 			}
+			storedHash, ok := vals[0].(string)
+			if !ok || storedHash == "" {
+				missing = append(missing, key)
+				continue
+			}
+			hashCandidates = append(hashCandidates, hashCandidate{key: key, hash: storedHash})
 		}
 	}
-	return missing, nil
+
+	// Phase 3: for keys with a stored val_hash, read current value and compare.
+	// Only keys whose hash differs are drifted (value changed while producer was down).
+	for _, hc := range hashCandidates {
+		if ctx.Err() != nil {
+			break
+		}
+		_, currentVal, readErr := reader.ReadValue(ctx, p.dataClient, hc.key)
+		if readErr != nil {
+			continue // key may have just expired; skip
+		}
+		if hashValue(currentVal) != hc.hash {
+			drifted = append(drifted, hc.key)
+		}
+	}
+
+	return missing, drifted, nil
 }
 
 func (p *Producer) listenMaster(ctx context.Context, idx int, client *redis.Client) {
@@ -747,9 +889,10 @@ func (p *Producer) handleEvent(ctx context.Context, msg *redis.Message, shadowAt
 	ts := p.clock.Now()
 	capturedAt := time.Now().UnixMilli()
 
-	// Build SeqID
+	// Build SeqID — includes bootEpochMs so seq counter resets after restarts
+	// never collide with the consumer's in-memory LRU dedup cache.
 	seq := p.seqNo.Add(1)
-	seqID := fmt.Sprintf("%s-%d", p.siteID, seq)
+	seqID := fmt.Sprintf("%s-%d-%d", p.siteID, p.bootEpochMs, seq)
 
 	// Compute absolute expiry epoch so the consumer can call PExpireAt directly
 	// without relying on clock synchronisation between sites (Feature 7).
@@ -778,7 +921,8 @@ func (p *Producer) handleEvent(ctx context.Context, msg *redis.Message, shadowAt
 	if keyType == "none" {
 		p.dataClient.Del(ctx, metaKey)
 	} else {
-		if err := metaCAS.Run(ctx, p.dataClient, []string{metaKey}, strconv.FormatUint(ts, 10), p.siteID).Err(); err != nil {
+		valHash := hashValue(value)
+		if err := metaCAS.Run(ctx, p.dataClient, []string{metaKey}, strconv.FormatUint(ts, 10), p.siteID, valHash).Err(); err != nil {
 			logger.Warn("metaCAS failed", zap.String("key", key), zap.String("metaKey", metaKey), zap.Error(err))
 		}
 	}

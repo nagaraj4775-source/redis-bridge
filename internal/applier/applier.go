@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"strconv"
 	"time"
 
@@ -185,16 +186,29 @@ func (a *Applier) Apply(ctx context.Context, delta bus.Delta) error {
 		}
 	}
 
-	// Phase 2: update __meta:{key} with HLC and site_id only after the value
-	// write committed. If this fails the consumer will not ACK the message;
-	// on retry ReadMeta returns the old (lower) HLC so the delta is accepted
-	// and both writes are re-attempted.
+	// Phase 2: update __meta:{key} with HLC, site_id, and val_hash after the
+	// value write committed. val_hash must be written here so the reconciler
+	// does not treat consumer-applied values as drifted on the next scan.
+	// If this fails the consumer will not ACK; on retry ReadMeta returns the
+	// old (lower) HLC so the delta is accepted and both writes are re-attempted.
 	metaKey := metaPrefix + delta.Key
-	if err := a.client.HSet(ctx, metaKey, "hlc", strconv.FormatUint(delta.HLC, 10), "site", delta.SiteID).Err(); err != nil {
+	args := []interface{}{"hlc", strconv.FormatUint(delta.HLC, 10), "site", delta.SiteID}
+	if delta.KeyType != "none" && len(delta.Value) > 0 {
+		args = append(args, "val_hash", hashValue(delta.Value))
+	}
+	if err := a.client.HSet(ctx, metaKey, args...).Err(); err != nil {
 		return fmt.Errorf("meta write: %w", err)
 	}
 
 	return nil
+}
+
+// hashValue returns the FNV-1a 64-bit hex fingerprint of a value blob.
+// Identical to the hashValue helper in producer so reconciler comparisons stay consistent.
+func hashValue(b []byte) string {
+	h := fnv.New64a()
+	h.Write(b)
+	return strconv.FormatUint(h.Sum64(), 16)
 }
 
 // ReadMeta reads the __meta:{key} hash for LWW comparison.
