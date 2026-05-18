@@ -129,6 +129,7 @@ func main() {
 		WithReconcileStartupDelay(time.Duration(cfg.Replication.ReconcileStartupDelaySeconds) * time.Second).
 		WithReconcileScanBatch(cfg.Replication.ReconcileScanBatchSize).
 		WithAutoBootstrapThreshold(cfg.Replication.AutoBootstrapThreshold).
+		WithPubDedup(cfg.Replication.PubDedup).
 		WithPatternFilter(cfg.Replication.IncludePatterns, cfg.Replication.ExcludePatterns)
 
 	// In cluster mode, enable automatic re-subscription when a replica is

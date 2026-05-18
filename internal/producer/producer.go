@@ -125,6 +125,7 @@ type Producer struct {
 	reconcileScanBatch       int // keys per SCAN cursor hop and HMGET pipeline batch (default 500)
 	autoBootstrapThreshold  int           // if missing-meta keys > this, auto-start bootstrap (0 = disabled)
 	reconcileStartupDelay   time.Duration // hold off first reconcile after restart (0 = no delay)
+	pubDedup                bool          // enable per-event SETNX publish dedup for HA multi-producer deployments
 
 	// Pattern filtering (Feature 5)
 	includeGlobs []string // if non-empty, key must match at least one
@@ -163,6 +164,7 @@ func New(siteID string, masters []*redis.Client, dataClient redis.UniversalClien
 		reconcileScanBatch:      500, // default; override with WithReconcileScanBatch
 		autoBootstrapThreshold:  0,             // disabled by default; override with WithAutoBootstrapThreshold
 		reconcileStartupDelay:   0,             // no delay by default; override with WithReconcileStartupDelay
+		pubDedup:                false,          // disabled by default; override with WithPubDedup
 		reconcileTrigger:  make(chan struct{}, 1),
 		reconcileStatus:   ReconcileStatus{Enabled: true},
 		bootstrapProg:     &bootstrapProgress{state: "idle"},
@@ -192,6 +194,17 @@ func (p *Producer) WithReconcileScanBatch(n int) *Producer {
 // new keys were inserted. Set to 0 (default) to disable auto-bootstrap.
 func (p *Producer) WithAutoBootstrapThreshold(n int) *Producer {
 	p.autoBootstrapThreshold = n
+	return p
+}
+
+// WithPubDedup enables per-event SETNX publish dedup so multiple producers
+// running on the same site only publish each event once. Use this when running
+// 3+ producers per site for HA. The winning producer acquires a short-lived
+// lock key (__pub:{key}:{hash} EX 3s); losers skip. After a successful
+// publish the winner marks __pub_done:{key}:{hash} EX 10s so late-arriving
+// producers also skip. Reconciler handles the rare crash-between-win-and-publish case.
+func (p *Producer) WithPubDedup(enabled bool) *Producer {
+	p.pubDedup = enabled
 	return p
 }
 
@@ -873,6 +886,33 @@ func (p *Producer) handleEvent(ctx context.Context, msg *redis.Message, shadowAt
 		return
 	}
 
+	// Per-event publish dedup for HA multi-producer deployments.
+	// All producers see the same keyspace event; only one should publish.
+	// Phase 1: check if another producer already published this event.
+	// Phase 2: race to acquire the short-lived publish lock.
+	var pubDedupHash string
+	if p.pubDedup && keyType != "none" {
+		pubDedupHash = hashValue(value)
+		// Use hash tags {key} so lock/done keys always land on the same cluster
+		// shard as the data key. This guarantees both agents race on the same
+		// Redis node regardless of cluster view differences during startup.
+		doneKey := fmt.Sprintf("__pub_done:{%s}:%s", key, pubDedupHash)
+		lockKey := fmt.Sprintf("__pub:{%s}:%s", key, pubDedupHash)
+		// Already published by another producer?
+		if n, _ := p.dataClient.Exists(ctx, doneKey).Result(); n > 0 {
+			logger.Debug("pub-dedup: already published by peer producer, skipping",
+				zap.String("key", key))
+			return
+		}
+		// Race for publish lock (EX 3s — if winner crashes, lock expires and reconciler handles it).
+		won, err := p.dataClient.SetNX(ctx, lockKey, fmt.Sprintf("%s-%d", p.siteID, p.bootEpochMs), 3*time.Second).Result()
+		if err != nil || !won {
+			logger.Debug("pub-dedup: lost publish race, skipping",
+				zap.String("key", key))
+			return
+		}
+	}
+
 	ttlMs, err := reader.ReadTTL(ctx, p.dataClient, key)
 	if err != nil {
 		logger.Debug("failed to read TTL", zap.String("key", key), zap.Error(err))
@@ -937,6 +977,12 @@ func (p *Producer) handleEvent(ctx context.Context, msg *redis.Message, shadowAt
 		}
 	}
 
+	// Mark publish done so other producers skip this event.
+	if p.pubDedup && pubDedupHash != "" {
+		doneKey := fmt.Sprintf("__pub_done:{%s}:%s", key, pubDedupHash)
+		p.dataClient.Set(ctx, doneKey, "1", 10*time.Second)
+	}
+
 	metrics.EventsCaptured.WithLabelValues(p.siteID, keyType).Inc()
 	metrics.EventsPublished.WithLabelValues(p.siteID).Inc()
 }
@@ -955,6 +1001,8 @@ func extractCommand(channel string) string {
 func isInternalKey(key string) bool {
 	return strings.HasPrefix(key, "__repl:") ||
 		strings.HasPrefix(key, "__meta:") ||
+		strings.HasPrefix(key, "__pub:") ||
+		strings.HasPrefix(key, "__pub_done:") ||
 		strings.HasPrefix(key, "repl:stream:") ||
 		strings.HasPrefix(key, "repl:dlq:")
 }

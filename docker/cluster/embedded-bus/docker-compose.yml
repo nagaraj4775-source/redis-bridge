@@ -10,9 +10,9 @@ version: "3.9"
 #   redis-a replica1/2/3  : 6421 / 6422 / 6423  (site-a has HA replicas)
 #   redis-b master1/2/3   : 6414 / 6415 / 6416
 #   redis-c master1/2/3   : 6417 / 6418 / 6419
-#   agent-a coordinator : 8291   metrics: 9291
-#   agent-b coordinator : 8292   metrics: 9292
-#   agent-c coordinator : 8293   metrics: 9293
+#   agent-a coordinator : 8291   metrics: 9291    agent-a-2 coordinator: 8294  metrics: 9294
+#   agent-b coordinator : 8292   metrics: 9292    agent-b-2 coordinator: 8295  metrics: 9295
+#   agent-c coordinator : 8293   metrics: 9293    agent-c-2 coordinator: 8296  metrics: 9296
 #
 # Usage:
 #   docker compose -f docker/cluster/embedded-bus/docker-compose.yml up --build -d
@@ -166,6 +166,46 @@ services:
     networks: [replnet]
     restart: unless-stopped
 
+  # ─── Secondary agents (HA ring — 2 full agents per site) ───
+  # pub_dedup:true ensures only one of the pair publishes each keyspace event.
+  # Consumer group load-balances apply work between both agents automatically.
+  # Reconciler is disabled on secondaries — primaries own reconciliation.
+  agent-a-2:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/redibridge/agent.yaml"]
+    volumes:
+      - ../../../config/cluster/embedded-bus/agent-a-2.yaml:/etc/redibridge/agent.yaml:ro
+    ports: ["8294:8080", "9294:9090"]
+    depends_on: [cluster-init-a, cluster-init-b, cluster-init-c]
+    networks: [replnet]
+    restart: unless-stopped
+
+  agent-b-2:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/redibridge/agent.yaml"]
+    volumes:
+      - ../../../config/cluster/embedded-bus/agent-b-2.yaml:/etc/redibridge/agent.yaml:ro
+    ports: ["8295:8080", "9295:9090"]
+    depends_on: [cluster-init-a, cluster-init-b, cluster-init-c]
+    networks: [replnet]
+    restart: unless-stopped
+
+  agent-c-2:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/redibridge/agent.yaml"]
+    volumes:
+      - ../../../config/cluster/embedded-bus/agent-c-2.yaml:/etc/redibridge/agent.yaml:ro
+    ports: ["8296:8080", "9296:9090"]
+    depends_on: [cluster-init-a, cluster-init-b, cluster-init-c]
+    networks: [replnet]
+    restart: unless-stopped
+
   # ─── Observability ───
   prometheus:
     image: prom/prometheus:v2.51.2
@@ -177,7 +217,7 @@ services:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
     ports: ["9090:9090"]
-    depends_on: [agent-a, agent-b, agent-c]
+    depends_on: [agent-a, agent-b, agent-c, agent-a-2, agent-b-2, agent-c-2]
     networks: [replnet]
     restart: unless-stopped
 

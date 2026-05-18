@@ -476,7 +476,223 @@ sudo docker exec embedded-bus-redis-a-master3-1 \
 
 ---
 
-## Step 14 — Remove a Consumer Agent Gracefully
+## Step 14 — Validate the HA Multi-Producer Ring
+
+Use this section when you have deployed **two full agents per site** (`pub_dedup: true` on both) to validate that:
+- Both agents are subscribed to keyspace events
+- Exactly one publishes per event (no duplicate stream entries)
+- The secondary agent captures events when the primary is down
+- The primary rejoins cleanly after restart
+
+> **Shorthands for secondary agents** (add alongside the primary ones from the top of this guide):
+> ```bash
+> AGENT_A2="http://localhost:8294"
+> AGENT_B2="http://localhost:8295"
+> AGENT_C2="http://localhost:8296"
+> ```
+
+---
+
+### 14a — Confirm Both Agents Are Subscribed on Every Master
+
+Each full agent subscribes to keyspace events on all 3 masters. With 2 agents running, each master should show `PUBSUB NUMPAT = 2`.
+
+```bash
+# Site-A masters — expect 2 (one per agent)
+sudo docker exec embedded-bus-redis-a-master1-1 redis-cli PUBSUB NUMPAT
+sudo docker exec embedded-bus-redis-a-master2-1 redis-cli PUBSUB NUMPAT
+sudo docker exec embedded-bus-redis-a-master3-1 redis-cli PUBSUB NUMPAT
+```
+
+**Expected:** `2` on each master.
+
+| Value | Meaning |
+|-------|---------|
+| `2` | Both agents subscribed ✓ |
+| `1` | One agent is down or still starting up |
+| `0` | No agent is subscribed — check agent logs |
+
+> If you see `2`, do NOT confuse this with having two producers that will double-publish. The `pub_dedup: true` config prevents that — both subscribe but only one publishes each event.
+
+---
+
+### 14b — Verify Exactly One Stream Entry per Write (Dedup Race Check)
+
+The core invariant of the HA ring: **one keyspace event → one stream entry**, regardless of how many agents are subscribed.
+
+```bash
+# Record stream length before the write
+BEFORE=$(sudo docker exec embedded-bus-redis-a-master1-1 redis-cli -c XLEN repl:stream:ec-site-a)
+
+# Write a key on site-a
+$REDIS_A SET ha:test:dedup "check-dedup"
+
+# Wait for both agents to process the event
+sleep 2
+
+# Record stream length after
+AFTER=$(sudo docker exec embedded-bus-redis-a-master1-1 redis-cli -c XLEN repl:stream:ec-site-a)
+
+echo "New entries added: $((AFTER - BEFORE))   (expected: 1)"
+```
+
+**Expected:** `New entries added: 1`
+
+If you see `2`, at least one agent has `pub_dedup: false` in its config. Check with:
+```bash
+sudo docker exec embedded-bus-agent-a-1   cat /etc/redibridge/agent.yaml | grep pub_dedup
+sudo docker exec embedded-bus-agent-a-2-1 cat /etc/redibridge/agent.yaml | grep pub_dedup
+```
+Both must show `pub_dedup: true`. Restart the agents after fixing.
+
+---
+
+### 14c — Verify the Dedup Lock Keys Exist in Redis
+
+After a write, the winning agent sets `__pub_done:{key}:hash` (TTL 10s). This key is your evidence the race ran correctly.
+
+```bash
+$REDIS_A SET ha:test:lockcheck "lock-test"
+sleep 1
+
+# Check on all masters for __pub_done keys
+# (hash tag {key} routes it to same shard as the data key)
+sudo docker exec embedded-bus-redis-a-master1-1 redis-cli KEYS "__pub_done*"
+sudo docker exec embedded-bus-redis-a-master2-1 redis-cli KEYS "__pub_done*"
+sudo docker exec embedded-bus-redis-a-master3-1 redis-cli KEYS "__pub_done*"
+```
+
+**Expected:** The key `__pub_done:{ha:test:lockcheck}:<hash>` appears on exactly one master.
+
+> The key will expire after 10 seconds. Run within 9 seconds of the write.
+
+---
+
+### 14d — HA Failover Test: Primary Down, Secondary Captures
+
+This is the main HA scenario. Kill the primary agent, write keys, and verify the secondary captures them.
+
+```bash
+# 1. Record baseline
+BEFORE=$(sudo docker exec embedded-bus-redis-a-master1-1 redis-cli -c XLEN repl:stream:ec-site-a)
+
+# 2. Kill the primary agent
+sudo docker stop embedded-bus-agent-a-1
+echo "Primary agent stopped"
+
+# 3. Write a key while ONLY the secondary is running
+$REDIS_A SET ha:test:failover "captured-by-secondary"
+sleep 3
+
+# 4. Check stream — secondary must have published exactly 1 entry
+AFTER=$(sudo docker exec embedded-bus-redis-a-master1-1 redis-cli -c XLEN repl:stream:ec-site-a)
+echo "New stream entries: $((AFTER - BEFORE))   (expected: 1)"
+
+# 5. Verify the key replicated to peer sites
+echo -n "Site-B: "; $REDIS_B GET ha:test:failover
+echo -n "Site-C: "; $REDIS_C GET ha:test:failover
+```
+
+**Expected:**
+```
+New stream entries: 1
+Site-B: captured-by-secondary
+Site-C: captured-by-secondary
+```
+
+---
+
+### 14e — Write Multiple Keys During Failover
+
+Confirm no event loss over a burst of writes with only the secondary alive.
+
+```bash
+# Write 10 keys on site-a (primary still down)
+for i in $(seq 1 10); do
+  $REDIS_A SET ha:test:burst:$i "burst-val-$i"
+done
+
+sleep 5
+
+# Confirm all 10 keys replicated to site-b
+MISSING=0
+for i in $(seq 1 10); do
+  VAL=$(sudo docker exec embedded-bus-redis-b-master1-1 redis-cli -c GET ha:test:burst:$i)
+  if [ "$VAL" != "burst-val-$i" ]; then
+    echo "MISSING: ha:test:burst:$i (got: $VAL)"
+    MISSING=$((MISSING + 1))
+  fi
+done
+
+echo "Missing keys on site-b: $MISSING  (expected: 0)"
+```
+
+**Expected:** `Missing keys on site-b: 0`
+
+---
+
+### 14f — Primary Rejoins: Dedup Still Works
+
+Restart the primary and confirm that writes with both agents up still produce exactly one stream entry each.
+
+```bash
+# Restart primary
+sudo docker start embedded-bus-agent-a-1
+sleep 15   # allow it to subscribe and stabilize
+
+# Confirm both are subscribed again
+sudo docker exec embedded-bus-redis-a-master1-1 redis-cli PUBSUB NUMPAT   # expect: 2
+
+# Write a key with both agents running
+BEFORE=$(sudo docker exec embedded-bus-redis-a-master1-1 redis-cli -c XLEN repl:stream:ec-site-a)
+$REDIS_A SET ha:test:rejoin "both-agents-up"
+sleep 2
+AFTER=$(sudo docker exec embedded-bus-redis-a-master1-1 redis-cli -c XLEN repl:stream:ec-site-a)
+
+echo "New entries with both agents up: $((AFTER - BEFORE))  (expected: 1)"
+echo -n "Site-B: "; $REDIS_B GET ha:test:rejoin
+echo -n "Site-C: "; $REDIS_C GET ha:test:rejoin
+```
+
+**Expected:**
+```
+2                              ← PUBSUB NUMPAT (both subscribed)
+New entries with both agents up: 1
+Site-B: both-agents-up
+Site-C: both-agents-up
+```
+
+---
+
+### 14g — Check Both Agent APIs Are Healthy
+
+```bash
+curl $AGENT_A/status  | python3 -m json.tool | grep -E "site_id|role|uptime_s"
+curl $AGENT_A2/status | python3 -m json.tool | grep -E "site_id|role|uptime_s"
+```
+
+**Expected:** Both show `"site_id": "ec-site-a"`, `"role": "full"`, and a positive `uptime_s`.
+
+Check the peer consumer count — with 2 full agents per site, each peer stream should show `consumers: 2`:
+
+```bash
+curl $AGENT_A/status | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+for p in d['peers']:
+    print(f\"  {p['site_id']}: consumers={p['stream']['consumers']} lag={p['stream']['lag']}\")
+"
+```
+
+**Expected:**
+```
+  ec-site-b: consumers=2 lag=0
+  ec-site-c: consumers=2 lag=0
+```
+
+---
+
+## Step 15 — Remove a Consumer Agent Gracefully
 
 When scaling down, Redis retains the consumer's PEL until it is cleaned up. Remove it explicitly to avoid orphaned pending entries:
 
@@ -510,7 +726,6 @@ Run through this checklist before going live:
 
 ```
 [ ] curl /health on all agents returns {"status":"ok",...}
-[ ] PUBSUB NUMPAT = 1 on each Redis master (producer subscribed)
 [ ] XLEN repl:stream:<site> grows after writes
 [ ] XINFO GROUPS shows lag=0 and pending=0 for all consumer groups
 [ ] curl /lag on all agents returns lag=0 for all peers
@@ -518,12 +733,25 @@ Run through this checklist before going live:
 [ ] LWW test: all 3 sites converge to the same value after concurrent writes
 [ ] Catch-up test: restarted agent replays all missed entries and reaches lag=0
 
+# If running single-agent per site (no HA ring):
+[ ] PUBSUB NUMPAT = 1 on each Redis master (producer subscribed)
+
 # If running consumer-only scale-out agents:
 [ ] Consumer-only agent logs show "role=consumer: producer disabled"
 [ ] XINFO CONSUMERS shows 2+ unique consumer names (no duplicates)
 [ ] PUBSUB NUMPAT = 1 per master (only one producer active)
 [ ] PEL split visible under load (both consumers show non-zero pending)
 [ ] All keys present and correct on the target site after split apply
+
+# If running HA multi-producer ring (2 full agents per site):
+[ ] PUBSUB NUMPAT = 2 on each Redis master (both agents subscribed)
+[ ] Both agent configs have pub_dedup: true
+[ ] curl /status on both agents returns role="full" and positive uptime_s
+[ ] curl /status shows consumers=2 for each peer stream
+[ ] Dedup test: one write → exactly 1 new stream entry (Step 14b)
+[ ] __pub_done:{key}:hash key visible in Redis within 10s of a write (Step 14c)
+[ ] Failover test: primary stopped → secondary publishes → key reaches all peer sites (Step 14d)
+[ ] Rejoin test: primary restarted → both up → still exactly 1 entry per write (Step 14f)
 ```
 
 ---
@@ -538,7 +766,12 @@ Run through this checklist before going live:
 | Stream grows forever | `stream_max_len` and `stream_ttl_hours` both 0 | Set `stream_ttl_hours` in agent config (e.g. `72` for 3 days) |
 | Agent crashes on startup | Bad config or Redis not reachable | Check `agent.yaml` and Redis connectivity |
 | Replication loop | Shadow key TTL too long | Default is `dedup_ttl_seconds: 5`; reduce if needed |
-| PUBSUB NUMPAT = 2 on a master | Two producers running on same site | Set `role: consumer` on the extra agent; restart it |
 | Two consumers have same name | `consumer_id` collision | Set explicit `consumer_id` in each agent's config |
-| Orphaned PEL after consumer removed | Consumer stopped without cleanup | Run `XAUTOCLAIM` + `XGROUP DELCONSUMER` (Step 14) |
+| Orphaned PEL after consumer removed | Consumer stopped without cleanup | Run `XAUTOCLAIM` + `XGROUP DELCONSUMER` (Step 15) |
 | Second consumer not appearing in XINFO | Consumer agent not yet connected | Check agent-2 logs; verify it uses the same `bus` config |
+| **HA ring: 2 entries per write** | One or both agents have `pub_dedup: false` | Set `pub_dedup: true` on all agents in site ring; restart |
+| **HA ring: 2 entries per write (config ok)** | Docker image cached old binary without dedup code | Rebuild with `docker compose build --no-cache`; recreate containers |
+| **HA ring: PUBSUB NUMPAT = 1** | Secondary agent is down or not yet subscribed | Check agent-2 logs; confirm cluster connectivity |
+| **HA ring: no `__pub_done:` key after write** | Agents still using old binary | Rebuild image `--no-cache`; verify by re-running Step 14c |
+| **HA ring: secondary not publishing during failover** | Secondary has `pub_dedup: true` but primary's lock key expired and `__pub_done` was never set | Wait for reconciler cycle (30s default) — or `POST /reconcile` on secondary |
+| **HA ring: PUBSUB NUMPAT = 2 (non-HA setup)** | Consumer-only agent accidentally set `role: full` | Fix to `role: consumer` and restart |

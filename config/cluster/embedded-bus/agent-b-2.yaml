@@ -1,0 +1,52 @@
+# ─ Secondary full agent for site-b (HA ring) ─────────────────────────────────
+# Runs alongside agent-b on the same site. Both are full mode (producer+consumer).
+# pub_dedup:true — only one of the two publishes each keyspace event.
+# Consumer group shared — messages load-balanced, never double-applied.
+# Reconciler disabled — agent-b (primary) owns reconciliation.
+# ─────────────────────────────────────────────────────────────────────────────
+
+site_id: "ec-site-b"
+role: "full"
+consumer_id: "agent-b-2"    # stable name — survives container restarts; no stale XINFO entries
+
+cluster:
+  mode: "cluster"
+  masters:
+    - "redis-b-master1:6379"
+    - "redis-b-master2:6379"
+    - "redis-b-master3:6379"
+  password: ""
+  tls: false
+
+bus:
+  mode: "embedded"
+  master_index: 0
+  peer_bus_addrs:
+    ec-site-a: "redis-a-master1:6379"
+    ec-site-c: "redis-c-master1:6379"
+  stream_prefix: "repl:stream:"
+  consumer_group: "repl-consumers"
+  stream_max_len: 1000000
+  stream_ttl_hours: 0
+  password: ""
+
+peers:
+  - "ec-site-a"
+  - "ec-site-c"
+
+replication:
+  batch_size: 100
+  apply_concurrency: 8
+  dedup_ttl_seconds: 5
+  max_in_flight: 1000
+  reconcile_interval_seconds: 0    # disabled — agent-b (primary) owns reconciliation
+  reconcile_startup_delay_seconds: 0
+  pub_dedup: true                  # races with agent-b; exactly one publishes per event
+  reconcile_scan_batch_size: 500
+  auto_bootstrap_threshold: 0
+
+coordinator:
+  port: 8080
+
+metrics:
+  port: 9090

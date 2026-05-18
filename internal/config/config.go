@@ -75,6 +75,7 @@ type ReplicationConfig struct {
 	MaxInFlight              int      `mapstructure:"max_in_flight"`
 	ReconcileIntervalSeconds      int      `mapstructure:"reconcile_interval_seconds"`       // 0 = disabled
 	ReconcileStartupDelaySeconds  int      `mapstructure:"reconcile_startup_delay_seconds"`  // hold off first reconcile scan after restart (0 = no delay)
+	PubDedup                      bool     `mapstructure:"pub_dedup"`                        // enable per-event SETNX publish dedup for HA multi-producer deployments
 	ReconcileScanBatchSize   int      `mapstructure:"reconcile_scan_batch_size"`   // keys per SCAN cursor hop and per HMGET pipeline batch (default 500)
 	AutoBootstrapThreshold  int      `mapstructure:"auto_bootstrap_threshold"`    // if missing-meta keys exceed this, auto-trigger bootstrap instead of reconciling (0 = disabled)
 	IncludePatterns          []string `mapstructure:"include_patterns"`            // if non-empty, only replicate keys matching at least one pattern

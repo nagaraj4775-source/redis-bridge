@@ -127,6 +127,193 @@ Site-A Redis ──keyspace events──► Agent-A (role: full)
 
 ---
 
+## HA Producer Ring — Multi-Producer per Site
+
+### The Problem: Single Producer is a SPOF
+
+The producer detects key changes via Redis PubSub keyspace notifications. This is **at-most-once** — if the producer process crashes or loses its connection for even a few milliseconds, any keyspace events fired during that window are **silently and permanently lost**. No retry, no buffer, no error.
+
+With a single producer per site, that process is a **Single Point of Failure** for event capture:
+
+```
+Site-A Redis ──keyspace events──► Agent-A (ONLY producer)
+                                      │
+                                   CRASHES
+                                      │
+                        App writes SET messages "hello"
+                        ← nobody is listening →
+                        event dropped forever, not in stream
+```
+
+The reconciler partially compensates (it scans for missing keys every 30s), but there is always a window of up to 30 seconds where writes go unreplicated.
+
+### The Solution: Active-Active with Publish-Side Dedup
+
+Run **two full agents per site**. Both subscribe to all keyspace events. When a write fires, both agents race to be the one that publishes it to the stream. Exactly one wins. The other is silently suppressed.
+
+```
+Site-A Redis ──keyspace events──► Agent-A   (full: producer + consumer)
+                │                     │
+                │                     └──► races to publish
+                │                              ↕  SETNX race
+                └──────────────────► Agent-A-2 (full: producer + consumer)
+                                          │
+                                          └──► races to publish
+                                          
+Only ONE publishes. The other returns silently.
+Stream: exactly 1 entry for the write ✓
+```
+
+If one agent goes down, the other continues capturing events immediately — no failover delay, no leader election, no external coordinator needed.
+
+### The Publish Race — Step by Step
+
+Every time `handleEvent` fires (for each keyspace notification), the winning logic runs atomically inside Redis:
+
+```
+Both agents receive keyspace event: SET messages "hello"
+         │
+         ▼
+1.  Compute val_hash = FNV-1a("hello") = "fd84a21a744eced4"
+
+2.  Check done key (already published by peer?):
+      EXISTS __pub_done:{messages}:fd84a21a744eced4
+      → 0 (not yet) → proceed
+
+3.  Race for publish lock (atomic SETNX on Redis):
+      Agent-A:   SET __pub:{messages}:fd84a21a744eced4 NX EX 3  → OK  (won)
+      Agent-A-2: SET __pub:{messages}:fd84a21a744eced4 NX EX 3  → nil (lost)
+      
+      Agent-A-2: returns silently  ✗
+
+4.  Agent-A: publish delta to repl:stream:ec-site-a  ✓
+
+5.  Agent-A: mark done so late-arriving agents also skip:
+      SET __pub_done:{messages}:fd84a21a744eced4 1 EX 10
+```
+
+Redis is single-threaded — the two `SetNX` calls are guaranteed to be processed sequentially. One and only one can return `OK`.
+
+### Why Hash Tags Matter
+
+The lock key uses **Redis cluster hash tags** `{key}`:
+
+```
+Lock key:  __pub:{messages}:fd84a21a744eced4
+Done key:  __pub_done:{messages}:fd84a21a744eced4
+```
+
+The curly braces tell Redis cluster to hash only the `messages` part. This ensures the lock key lands on **the same cluster shard as the data key** regardless of which master each agent happens to connect to first.
+
+Without hash tags, two agents with slightly different cluster topology views could route their `SetNX` to **different shards**, making both win — causing duplicate stream entries.
+
+### What Happens if the Winner Crashes Mid-Publish?
+
+```
+Agent-A wins lock (__pub:{messages}:... EX 3s)
+Agent-A crashes before publishing to stream
+→ lock key expires after 3 seconds
+→ next keyspace event (or reconciler) will re-publish cleanly
+→ __pub_done key is never set, so the next event is not suppressed
+```
+
+The 3-second lock TTL is the worst-case gap window for a crash-between-lock-and-publish scenario. The reconciler's next cycle will re-publish the missed key.
+
+### Consumer Side — Natural Load Balancing
+
+Both full agents also run consumers. They share the **same consumer group** for each peer stream. Redis Streams naturally partitions work:
+
+```
+repl:stream:ec-site-b  (incoming events from site-b)
+  ┌──────────────────────────────────────────────────────────┐
+  │  XREADGROUP call by Agent-A   → gets entries 1, 3, 5…   │
+  │  XREADGROUP call by Agent-A-2 → gets entries 2, 4, 6…   │
+  └──────────────────────────────────────────────────────────┘
+  Each entry is delivered to exactly ONE consumer. ✓
+  2 agents = 2× apply throughput.
+```
+
+No configuration is needed for this — it is a built-in property of Redis consumer groups. You get **both** HA (producer side) and **horizontal apply scaling** (consumer side) from the same two agents.
+
+### Reconciler Ownership
+
+With two agents running, only the **primary** (the original agent) runs the reconciler. The secondary has `reconcile_interval_seconds: 0`. This prevents double-scanning and unnecessary re-publishes. If the primary is permanently removed, update the secondary's config to enable reconciliation.
+
+### Configuration
+
+Add `pub_dedup: true` to **every producer** in a site's HA ring. If any producer has it false, it will publish without racing, causing duplicate stream entries.
+
+```yaml
+# agent-a.yaml  (primary — also runs reconciler)
+replication:
+  reconcile_interval_seconds: 30    # primary owns reconciliation
+  pub_dedup: true                   # races with agent-a-2; one publishes per event
+
+# agent-a-2.yaml  (secondary — no reconciler)
+replication:
+  reconcile_interval_seconds: 0     # disabled — primary handles this
+  pub_dedup: true                   # races with agent-a; one publishes per event
+```
+
+### Architecture Diagram (2 Full Agents per Site)
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                             SITE-A                                  │
+│                                                                     │
+│  App writes: SET messages "hello"                                   │
+│        │                                                            │
+│        ▼                                                            │
+│  Redis Cluster ──keyspace events──► Agent-A (full, primary)        │
+│        │                              │  Producer: SETNX race      │
+│        │                              │  Consumer: reads B + C      │
+│        │                              │  Reconciler: enabled        │
+│        │                              │                             │
+│        └──────────────────────────► Agent-A-2 (full, secondary)   │
+│                                       │  Producer: SETNX race      │
+│                                       │  Consumer: reads B + C      │
+│                                       │  Reconciler: disabled       │
+│                                       │                             │
+│                         SETNX race → only ONE publishes             │
+│                                       │                             │
+│                                       ▼                             │
+│                             repl:stream:ec-site-a                   │
+│                             (exactly 1 entry per write) ✓           │
+└─────────────────────────────────────────────────────────────────────┘
+              │ stream consumed by agents at site-b and site-c
+              ▼
+     Site-B and Site-C apply delta via LWW ✓
+```
+
+### Docker Compose Layout (Cluster + Embedded Bus + HA Ring)
+
+```
+docker/cluster/embedded-bus/
+  redis-a-master1,2,3     ← Site-A Redis Cluster (3 masters + 3 replicas)
+  redis-a-replica1,2,3
+  redis-b-master1,2,3     ← Site-B Redis Cluster
+  redis-c-master1,2,3     ← Site-C Redis Cluster
+  agent-a   (port 8291)   ← Primary full agent for Site-A  (reconciler ON)
+  agent-a-2 (port 8294)   ← Secondary full agent for Site-A (reconciler OFF)
+  agent-b   (port 8292)   ← Primary full agent for Site-B
+  agent-b-2 (port 8295)   ← Secondary full agent for Site-B
+  agent-c   (port 8293)   ← Primary full agent for Site-C
+  agent-c-2 (port 8296)   ← Secondary full agent for Site-C
+```
+
+Config files for secondary agents:
+```
+config/cluster/embedded-bus/
+  agent-a.yaml    ← primary (pub_dedup: true, reconcile: 30s)
+  agent-a-2.yaml  ← secondary (pub_dedup: true, reconcile: 0)
+  agent-b.yaml
+  agent-b-2.yaml
+  agent-c.yaml
+  agent-c-2.yaml
+```
+
+---
+
 ## Step-by-Step Replication Flow
 
 ```
